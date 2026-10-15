@@ -79,6 +79,7 @@ func newTestDirectory(stub *dnsStub, clk *fakeClock, static []netip.Prefix, carr
 		lookupIP:  stub.lookupIP,
 		now:       clk.now,
 		entries:   map[string]*carrierEntry{},
+		pins:      map[string]*carrierPin{},
 		rnd:       rand.New(rand.NewSource(1)),
 	}
 	d.publish()

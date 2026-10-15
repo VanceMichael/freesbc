@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 新 (AoR, Call-ID) 在转发 REGISTER 前原子预留 Location 总量和单 AoR 容量；并发争用最后名额时只有一个事务获得预留，其他事务返回稳定 503 与 Retry-After。
+  - id: 2
+    type: f2p
+    text: 已有 (AoR, Call-ID) 的 refresh 在容量已满时仍可沿用原 token 和容量位置，更新 registrar 授予的 expiry 与最新来源，不创建额外预留或错误 503。
+  - id: 3
+    type: f2p
+    text: registrar 的 2xx 只在预留仍有效时原子提交 binding，并在提交成功后才恢复客户端 Contact 和转发 2xx；本地提交失败绝不再让客户端看见注册成功。
+  - id: 4
+    type: f2p
+    text: challenge、非 2xx、传输错误、全 upstream 零响应、共享超时及事务取消都会恰好释放对应预留；后续注册可立即复用容量，不发生泄漏、双重释放或跨事务误释放。
+  - id: 5
+    type: f2p
+    text: TCP/TLS/WS/WSS 来源连接关闭会移除已提交绑定并使该来源未提交预留失效；随后到达的 registrar 2xx 不能安装不可达 binding 或被记录为成功。
+  - id: 6
+    type: f2p
+    text: 普通注销、wildcard 注销、过期 prune 与 RemoveBySource 正确释放 committed 容量，并继续通过现有 onRemove 触发订阅清理；释放后被拒绝的新注册能够恢复成功。
+  - id: 7
+    type: p2p
+    text: 普通新注册、REGISTER 多节点故障转移、granted expiry、Contact 恢复、enumeration limit 与现有 Location 索引保持固定版本兼容；metrics 和日志区分 capacity reject 与 accepted registration。

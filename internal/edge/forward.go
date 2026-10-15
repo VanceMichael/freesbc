@@ -293,7 +293,8 @@ func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.S
 var errNoFlow = errors.New("proxy: no connection to the client")
 
 // requireFlow refuses to send a request over a stream transport when the
-// connection to its destination is not in sipgo's pool.
+// connection to its destination is not in sipgo's pool, unless the
+// destination is a carrier address FreeSBC dials itself (carrierconn.go).
 //
 // A client on a stream transport is reachable only through the connection
 // it opened: it is usually behind NAT, its Contact is no address to dial,
@@ -303,21 +304,49 @@ var errNoFlow = errors.New("proxy: no connection to the client")
 // as for any transport failure (480 or 408 to an INVITE, nothing sent for
 // the rest).
 //
-// The one exception is a tcp or tls carrier: its destination is an address
-// FreeSBC resolved from edge.carriers, so a missing connection is dialed
-// here (carrierconn.go) with that carrier's TLS settings, never by sipgo.
+// Carrier destinations are resolved in three steps, in this order:
+//
+//  1. A request whose context carries a dialog's pinned carrier name (the
+//     carrier the call was born on) dials with THAT carrier's settings
+//     whenever the dialog still holds the route. This is what lets an
+//     in-dialog ACK, BYE, PRACK, UPDATE, INFO or NOTIFY redial an address
+//     the current DNS snapshot has retired, with the creation-time TLS/SNI
+//     and client certificate — even when another carrier now resolves to
+//     the same address, and even when the call was still early (a CANCEL
+//     between the INVITE and the 2xx).
+//  2. The current snapshot names the destination as a carrier's own
+//     resolved address: the destination of a NEW, out-of-dialog transaction
+//     (carrierDest reads nothing older). A retired address is never here.
+//  3. A single live dialog pins the destination to one carrier although
+//     the snapshot no longer names it: the teardown requests FreeSBC
+//     originates itself (a BYE after a media fault, an ACK of a 2xx) carry
+//     no context of their own, so they take that one owner. Two carriers
+//     pinning the same retired address is ambiguous and fails closed.
+//
+// A connection already in the pool is reused whatever it was dialed as,
+// before any of this: a live flow is the creation-time flow and asks no
+// questions. UDP creates no connection and is left entirely to sipgo.
 func (s *Server) requireFlow(ctx context.Context, req *sip.Request) error {
 	network := sip.NetworkToLower(req.Transport())
 	if streamIndex(network) < 0 {
 		return nil
 	}
-	c, err := s.srv.TransportLayer().GetConnection(network, req.Destination())
-	if err == nil && c != nil {
+	dest := req.Destination()
+	tl := s.srv.TransportLayer()
+	if c, err := tl.GetConnection(network, dest); err == nil && c != nil {
 		_, _ = c.TryClose() // GetConnection took a reference; hand it back
 		return nil
 	}
-	if name, ok := s.carrierTarget(network, req.Destination()); ok {
-		return s.carrierConns.ensure(ctx, name, network, req.Destination())
+	if name := carrierRouteFromContext(ctx); name != "" && s.carriers.pinnedRoute(name, network, dest) {
+		return s.carrierConns.ensure(ctx, name, network, dest)
+	}
+	if name, ok := s.carriers.snapshot().exactCarrier(network, dest); ok {
+		return s.carrierConns.ensure(ctx, name, network, dest)
+	}
+	if name, ok := s.carriers.retiredOwner(network, dest); ok {
+		s.log.Debug("redialing a carrier address a live dialog pinned before it retired",
+			"carrier", name, "transport", network, "dest", dest, "sip_call_id", fsip.CallID(req))
+		return s.carrierConns.ensure(ctx, name, network, dest)
 	}
 	return errNoFlow
 }
@@ -334,7 +363,15 @@ func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTran
 // writeRequest sends a request outside any transaction (an ACK), after
 // requireFlow.
 func (s *Server) writeRequest(req *sip.Request) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
+	return s.writeRequestFor(req, "")
+}
+
+// writeRequestFor is writeRequest for a request sent on behalf of a dialog
+// pinned to carrier: when its destination left the current DNS generation
+// and the pooled connection is gone, the request redials the old remote
+// with that carrier's own TLS settings (requireFlow).
+func (s *Server) writeRequestFor(req *sip.Request, carrier string) error {
+	ctx, cancel := context.WithTimeout(withCarrierRoute(context.Background(), carrier), 2*streamHandshakeTimeout)
 	defer cancel()
 	if err := s.requireFlow(ctx, req); err != nil {
 		return err

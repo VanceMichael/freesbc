@@ -219,6 +219,14 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	defer d.endUnlessUp()
 	d.setCarrier(carrier)
 	d.setSRTP(s.legSRTPPolicy(carrier, ""))
+	// Pin the call to the carrier generation this INVITE was built from:
+	// after a refresh moves the snapshot elsewhere, the call's ACK, CANCEL,
+	// BYE, PRACK and UPDATE keep this carrier's identity, transport and
+	// remote, and a lost flow redials the old remote with THIS carrier's
+	// TLS/SNI/certificate. New, out-of-dialog transactions are unaffected;
+	// carrierDest reads the current snapshot.
+	d.attachRoutePin(s.carriers.retain(carrier, to.transport, dest))
+	ctx = withCarrierRoute(ctx, carrier)
 
 	// An offerless INVITE is forwarded as it is: the offer is the
 	// carrier's first SDP, built into a private one when it arrives
@@ -271,7 +279,7 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}) {
 		return
 	}
-	a := &inviteAttempt{req: out, cancel: cancel}
+	a := &inviteAttempt{req: out, cancel: cancel, carrier: carrier}
 	if !d.track(a) {
 		return
 	}

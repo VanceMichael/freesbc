@@ -113,6 +113,27 @@ func (c *carrierSnapshot) carrierFor(src netip.AddrPort, network string) (name s
 	return "", false
 }
 
+// exactCarrier names the carrier whose CURRENT snapshot lists dest
+// ("IP:port") as one of its own-transport resolved addresses. Unlike
+// carrierFor it never matches by IP alone: the destination must be the
+// exact resolved address FreeSBC would dial, which is the only case the
+// carrier connection layer dials a stream itself. This is the admission
+// for NEW, out-of-dialog transactions: a destination the current
+// generation no longer names is not found here, however recently it did.
+func (c *carrierSnapshot) exactCarrier(network, dest string) (string, bool) {
+	for _, n := range c.names {
+		if c.transports[n] != network {
+			continue
+		}
+		for _, a := range c.addrs[n] {
+			if a.String() == dest {
+				return n, true
+			}
+		}
+	}
+	return "", false
+}
+
 // sourcesString renders the source set for the startup log.
 func (c *carrierSnapshot) sourcesString() string {
 	parts := make([]string, len(c.nets))
@@ -120,6 +141,109 @@ func (c *carrierSnapshot) sourcesString() string {
 		parts[i] = p.String()
 	}
 	return strings.Join(parts, ",")
+}
+
+// carrierPin is one creation-time carrier route a dialog keeps using after
+// the directory's current generation moved on: the carrier name as it was
+// when the call was placed, the transport of that carrier, and the exact
+// remote address the call was connected to. A pin never feeds a snapshot —
+// it neither admits a new inbound call nor selects a destination for a new
+// out-of-dialog one; it only lets the dialogs that hold it redial the old
+// remote with the pinned carrier's own TLS/SNI/certificate settings when
+// the pooled connection to it is gone.
+type carrierPin struct {
+	carrier string
+	network string
+	dest    string
+	refs    int
+}
+
+func carrierPinKey(carrier, network, dest string) string {
+	return network + "\x00" + dest + "\x00" + carrier
+}
+
+// retain pins a creation-time route and returns its release. Every call
+// pairs with exactly one release: the returned function is idempotent, and
+// the record is reclaimed when the last holder — the last dialog of that
+// route — releases it. A route the current snapshot still names is found
+// through the snapshot anyway, but pinning it is what keeps the route
+// usable across the refresh that retires it, whenever that comes. A pin is
+// lifecycle bookkeeping only: UDP pins never create a connection object,
+// and no pin is ever consulted by admission.
+func (d *carrierDirectory) retain(carrier, network, dest string) func() {
+	if carrier == "" || carrier == carrierUnknown || network == "" || dest == "" {
+		return func() {}
+	}
+	key := carrierPinKey(carrier, network, dest)
+	d.routeMu.Lock()
+	p := d.pins[key]
+	if p == nil {
+		p = &carrierPin{carrier: carrier, network: network, dest: dest}
+		d.pins[key] = p
+	}
+	p.refs++
+	d.routeMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.routeMu.Lock()
+			p := d.pins[key]
+			if p != nil {
+				p.refs--
+				if p.refs <= 0 {
+					delete(d.pins, key)
+				}
+			}
+			d.routeMu.Unlock()
+		})
+	}
+}
+
+// pinnedRoute reports whether carrier currently holds a creation-time
+// route to dest over network — the exact-ownership lookup of a request
+// whose dialog already named its carrier. It is checked before the current
+// snapshot so that an address a different carrier now owns (or the same
+// carrier's new generation) never borrows the dialog's pinned identity.
+func (d *carrierDirectory) pinnedRoute(carrier, network, dest string) bool {
+	if carrier == "" {
+		return false
+	}
+	d.routeMu.Lock()
+	defer d.routeMu.Unlock()
+	p := d.pins[carrierPinKey(carrier, network, dest)]
+	return p != nil && p.refs > 0
+}
+
+// retiredOwner names the single carrier a destination is pinned to by a
+// live dialog when it is no longer in the current snapshot. It is the
+// fallback for a teardown request (a FreeSBC-originated ACK or BYE) that
+// carries no carrier hint of its own. When two carriers pin the same
+// retired destination ownership is ambiguous and nothing is returned: the
+// caller fails closed rather than dial one carrier with another's TLS
+// configuration.
+func (d *carrierDirectory) retiredOwner(network, dest string) (string, bool) {
+	prefix := network + "\x00" + dest + "\x00"
+	d.routeMu.Lock()
+	defer d.routeMu.Unlock()
+	owner := ""
+	for key, p := range d.pins {
+		if p.refs <= 0 || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if owner != "" && owner != p.carrier {
+			return "", false
+		}
+		owner = p.carrier
+	}
+	return owner, owner != ""
+}
+
+// pinCount is how many creation-time routes currently have a holder (tests
+// and shutdown diagnostics).
+func (d *carrierDirectory) pinCount() int {
+	d.routeMu.Lock()
+	defer d.routeMu.Unlock()
+	return len(d.pins)
 }
 
 // carrierEntry is the cached resolution of one DNS-name carrier.
@@ -145,6 +269,14 @@ type carrierDirectory struct {
 	entries map[string]*carrierEntry
 	rnd     *rand.Rand
 
+	// routeMu guards pins: the creation-time carrier routes live dialogs
+	// are pinned to after the snapshot generation they were born in moved
+	// on. The table is independent of the published snapshot: a retired
+	// route never enters the snapshot's addresses, source prefixes or
+	// admission, and the last dialog's release reclaims the record.
+	routeMu sync.Mutex
+	pins    map[string]*carrierPin
+
 	snap atomic.Pointer[carrierSnapshot]
 }
 
@@ -162,6 +294,7 @@ func newCarrierDirectory(cfg *config.Config, log *slog.Logger) *carrierDirectory
 		},
 		now:     time.Now,
 		entries: map[string]*carrierEntry{},
+		pins:    map[string]*carrierPin{},
 		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	d.publish()

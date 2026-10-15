@@ -137,22 +137,27 @@ func (cc *carrierConns) destLock(dest string) *sync.Mutex {
 	return m
 }
 
-// carrierTarget names the tcp or tls carrier whose resolved address is dest,
-// for a request leaving over network. It is the only case FreeSBC dials a
-// stream connection: a client's flow is never dialed (requireFlow).
-func (s *Server) carrierTarget(network, dest string) (string, bool) {
-	snap := s.carriers.snapshot()
-	for _, name := range snap.names {
-		if snap.transports[name] != network {
-			continue
-		}
-		for _, a := range snap.addrs[name] {
-			if a.String() == dest {
-				return name, true
-			}
-		}
+// carrierRouteKey carries the carrier name a request's dialog was born on
+// through the context to requireFlow, so a stream dial after the carrier's
+// DNS generation changed keeps the creation-time carrier identity — its TLS
+// server name, roots and client certificate — rather than looking the
+// destination up in the current snapshot.
+type carrierRouteKey struct{}
+
+// withCarrierRoute returns ctx carrying carrier as the pinned carrier of
+// the request about to be sent. An empty carrier leaves ctx unchanged.
+func withCarrierRoute(ctx context.Context, carrier string) context.Context {
+	if carrier == "" {
+		return ctx
 	}
-	return "", false
+	return context.WithValue(ctx, carrierRouteKey{}, carrier)
+}
+
+// carrierRouteFromContext is the pinned carrier name withCarrierRoute put
+// in ctx, or "".
+func carrierRouteFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(carrierRouteKey{}).(string)
+	return name
 }
 
 // ensure returns once sipgo's pool holds a connection to dest, dialing the

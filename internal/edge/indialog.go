@@ -80,6 +80,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
+	ctx = withCarrierRoute(ctx, d.carrierName())
 
 	clTx, err := s.clientTx(ctx, out)
 	if err != nil {
@@ -107,7 +108,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		if again {
 			// A 2xx FreeSBC could not anchor, retransmitted: its ACK was
 			// lost, so send it again.
-			go s.ack2xx(res, to)
+			go s.ack2xx(res, to, d.carrierName())
 			return
 		}
 		if ok == nil || fsip.ToTag(res) != fsip.ToTag(ok) {
@@ -203,24 +204,24 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 				s.log.Warn("re-INVITE media negotiation failed", "err", err, "sip_call_id", fsip.CallID(req))
 				s.reject(req, tx, 488, "Not Acceptable Here")
 				if is2xx {
-					// The far end accepted a session FreeSBC cannot anchor.
-					// Its 2xx must still be ACKed (RFC 3261 §13.3.1.4) or it
-					// retransmits and then drops the call; and the two ends
-					// now disagree about the session — media would flow in a
-					// form one of them never agreed to — so the call is ended
-					// on both sides rather than left half-renegotiated.
-					finalised = true
-					mu.Lock()
-					refused = true
-					mu.Unlock()
-					s.ack2xx(res, to)
-					if d.end(endReinviteRefused) {
-						s.byeBothEnds(d, endReinviteRefused)
-					}
+				// The far end accepted a session FreeSBC cannot anchor.
+				// Its 2xx must still be ACKed (RFC 3261 §13.3.1.4) or it
+				// retransmits and then drops the call; and the two ends
+				// now disagree about the session — media would flow in a
+				// form one of them never agreed to — so the call is ended
+				// on both sides rather than left half-renegotiated.
+				finalised = true
+				mu.Lock()
+				refused = true
+				mu.Unlock()
+				s.ack2xx(res, to, d.carrierName())
+				if d.end(endReinviteRefused) {
+					s.byeBothEnds(d, endReinviteRefused)
 				}
-				return
 			}
-			if res.StatusCode >= 200 {
+			return
+		}
+		if res.StatusCode >= 200 {
 				finalised = is2xx
 				if is2xx {
 					s.armOwedTimer(d)
@@ -237,7 +238,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			// INVITE) and answer the requester 408, or it waits out its own
 			// timer and the far end keeps an open INVITE transaction that
 			// 491s every later re-INVITE (§14.1).
-			s.abandonReInvite(req, tx, out, clTx, to)
+			s.abandonReInvite(req, tx, out, clTx, to, d.carrierName())
 			return
 		}
 	}
@@ -246,14 +247,15 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 // abandonReInvite ends a re-INVITE whose backstop expired: the requester is
 // answered 408 and the forwarded re-INVITE is CANCELled. CANCEL is built
 // from out, the request as it went on the wire, so a carrier leg's CANCEL
-// carries the same hidden identity as the re-INVITE (hide.go). The
+// carries the same hidden identity as the re-INVITE (hide.go) and keeps
+// the dialog's creation-time carrier when it has to redial. The
 // transaction is then drained for the final the CANCEL provokes, so a 487
 // is ACKed by the transaction layer and a 2xx that crossed the CANCEL is
 // ACKed here rather than retransmitted.
 func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
-	clTx sip.ClientTransaction, to side) {
+	clTx sip.ClientTransaction, to side, carrier string) {
 	s.reject(req, tx, 408, "Request Timeout")
-	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}})
+	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}, carrier: carrier})
 	drain := time.NewTimer(cancelDrain)
 	defer drain.Stop()
 	responses := clTx.Responses()
@@ -265,7 +267,7 @@ func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out
 				continue
 			}
 			if res.StatusCode/100 == 2 {
-				s.ack2xx(res, to)
+				s.ack2xx(res, to, carrier)
 			}
 			if res.StatusCode >= 200 {
 				return
@@ -366,7 +368,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 			stripBody(out)
 		}
 	}
-	if err := s.writeRequest(out); err != nil {
+	if err := s.writeRequestFor(out, dialogCarrier(d)); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
 	if answerFailed && d.end(endAnswerUnusable) {
@@ -637,6 +639,9 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
+	// A carrier dialog's request keeps its creation-time carrier when a
+	// lost flow has to redial an address the current snapshot retired.
+	ctx = withCarrierRoute(ctx, dialogCarrier(d))
 	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt)
 	if err != nil {
 		s.log.Warn("forward in-dialog request failed", "err", err,
@@ -655,8 +660,9 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		if req.Method == sip.BYE {
 			// A clone: the failed client transaction may still hold the
 			// original request (a retransmission timer winding down), so
-			// handing the same object to WriteRequest would race it.
-			if werr := s.writeRequest(out.Clone()); werr != nil {
+			// handing the same object to WriteRequest would race it. The
+			// carrier hint keeps a retired route dialable for the clone.
+			if werr := s.writeRequestFor(out.Clone(), dialogCarrier(d)); werr != nil {
 				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
 					"sip_call_id", fsip.CallID(req))
 			}
@@ -860,6 +866,16 @@ func otherPlane(p plane) plane {
 	return planePublic
 }
 
+// dialogCarrier is the creation-time carrier name of d for a send that may
+// need it to redial a retired route, "" when there is no dialog or the call
+// is not a carrier's. Sends toward the private plane ignore the hint.
+func dialogCarrier(d *dialog) string {
+	if d == nil {
+		return ""
+	}
+	return d.carrierName()
+}
+
 // retargetInDialog replaces the Request-URI of a forwarded in-dialog
 // request with the far endpoint's own Contact, undoing the topology hiding
 // the proxy applied when the dialog was established. Falls back to the
@@ -952,7 +968,7 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 		req.Laddr = toward.laddr
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withCarrierRoute(context.Background(), b.carrierName), 5*time.Second)
 	defer cancel()
 	clTx, err := s.clientTx(ctx, req)
 	if err != nil {

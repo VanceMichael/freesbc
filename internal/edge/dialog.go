@@ -119,6 +119,12 @@ type inviteAttempt struct {
 	req    *sip.Request
 	cancel context.CancelFunc
 
+	// carrier is the edge.carriers name the INVITE was sent to, "" for a
+	// non-carrier attempt. The CANCEL and the redial after a lost
+	// connection must keep the call's creation-time carrier identity,
+	// including after a DNS refresh changed the snapshot.
+	carrier string
+
 	sent, cancelled bool
 }
 
@@ -267,6 +273,15 @@ type dialog struct {
 	// media is the anchored session. It is attached once, right after the
 	// record is created, and then only closed — never replaced.
 	media *mediaSession
+
+	// releasePin ends the dialog's hold on its creation-time carrier
+	// route (carrierdns.go), set once through attachRoutePin. The route a
+	// carrier call was born on must stay dialable for the dialog's whole
+	// life, including its early phase and teardown; the single state
+	// transition in end() is the one release, so CANCEL, a non-2xx, a
+	// timeout, a media fault, a BYE and shutdown all release it exactly
+	// once, and the last dialog of a retired address reclaims it.
+	releasePin func()
 
 	// forks holds the early dialogs by To tag, and applied names the one
 	// whose answer the media currently follows. Both are cleared on
@@ -524,14 +539,26 @@ func (t *dialogTable) newestRoutedByCallID(callID string) (*dialog, dialogRoute,
 
 // usesRemote reports whether a live dialog is routed to the public remote
 // (an "IP:port") over transport: the stream connection to it carries a call
-// and must not be closed for being quiet.
+// and must not be closed for being quiet. A confirmed dialog matches its
+// route; an early one matches the route any of its forks recorded for a
+// PRACK or UPDATE, so a carrier connection stays alive while a call is
+// still ringing too.
 func (t *dialogTable) usesRemote(transport, remote string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, ds := range t.byCallID {
 		for _, d := range ds {
-			if d.state != dialogEnded && d.route.publicRemote == remote && strings.EqualFold(d.route.transport, transport) {
+			if d.state == dialogEnded {
+				continue
+			}
+			if d.route.publicRemote == remote && strings.EqualFold(d.route.transport, transport) {
 				return true
+			}
+			for _, f := range d.forks {
+				if f.routed && f.route.publicRemote == remote &&
+					strings.EqualFold(f.route.transport, transport) {
+					return true
+				}
 			}
 		}
 	}
@@ -670,6 +697,32 @@ func (d *dialog) open() bool {
 	d.tab.mu.Lock()
 	defer d.tab.mu.Unlock()
 	return !d.tab.closed && d.state != dialogEnded
+}
+
+// attachRoutePin ties the release of a retained creation-time carrier
+// route (carrierDirectory.retain) to the dialog's single end(). Called
+// once, right after the record opened and before the INVITE is sent, so
+// the route already outlives a CANCEL or a shutdown that wins the race.
+// When the dialog has already ended the release runs at once, like
+// attach's handling of a late media session.
+func (d *dialog) attachRoutePin(release func()) {
+	if release == nil {
+		return
+	}
+	d.tab.mu.Lock()
+	if d.state == dialogEnded {
+		d.tab.mu.Unlock()
+		release()
+		return
+	}
+	prev := d.releasePin
+	d.releasePin = func() {
+		if prev != nil {
+			prev()
+		}
+		release()
+	}
+	d.tab.mu.Unlock()
 }
 
 // session is the anchored media session, or nil before one is attached.
@@ -1092,6 +1145,11 @@ type byeInfo struct {
 	contact   sip.Uri
 	transport string
 	carrier   bool // the dialog is a carrier's: masking applies toward the public side
+	// carrierName is the edge.carriers name the call was born on, "" for
+	// a non-carrier call. A BYE redialed after the pooled connection was
+	// lost uses it, so a carrier address retired mid-call keeps the
+	// dialog's creation-time TLS/SNI/certificate settings.
+	carrierName string
 }
 
 // byes describes the two BYEs that end this dialog from the middle: one to
@@ -1112,10 +1170,12 @@ func (d *dialog) byes() [2]byeInfo {
 	return [2]byeInfo{
 		{callID: d.callID, toward: d.callerPlane,
 			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
-			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport,
+			carrier: d.carrier != "", carrierName: d.carrier},
 		{callID: d.callID, toward: calleePlane,
 			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
-			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport,
+			carrier: d.carrier != "", carrierName: d.carrier},
 	}
 }
 
@@ -1210,10 +1270,19 @@ func (d *dialog) end(reason endReason) bool {
 	d.owed = nil
 	d.lastAck = nil
 	sess := d.media
+	release := d.releasePin
+	d.releasePin = nil
 	t.removeLocked(d)
 	t.sessions--
 	t.metrics.SetSessions(t.sessions)
 	t.mu.Unlock()
+
+	if release != nil {
+		// The creation-time carrier route outlives the table lock and
+		// the media close, and is released by this one state transition
+		// exactly once: the last dialog of a retired address reclaims it.
+		release()
+	}
 
 	if sess == nil {
 		return wasUp

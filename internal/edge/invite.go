@@ -322,6 +322,19 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	defer d.endUnlessUp()
 	if carrier != "" {
 		d.setCarrier(carrier)
+		// When the carrier reached FreeSBC over a connection to one of its
+		// own resolved addresses — the connection FreeSBC opened to it,
+		// which the carrier sends back down — the call keeps that exact
+		// creation-time route: if it retires in a later DNS generation,
+		// the call's in-dialog traffic redials the old remote with this
+		// carrier's settings. A carrier dialing in from an ephemeral
+		// source port is not a destination FreeSBC can dial, so it gets
+		// no pin; the live pooled connection still carries the call.
+		if carrier != carrierUnknown {
+			if name, ok := s.carriers.snapshot().exactCarrier(from.transport, src.String()); ok && name == carrier {
+				d.attachRoutePin(s.carriers.retain(carrier, from.transport, src.String()))
+			}
+		}
 	}
 	d.setSRTP(s.legSRTPPolicy(carrier, from.transport))
 

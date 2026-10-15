@@ -119,13 +119,15 @@ func (s *Server) onLate2xx(l *inviteLeg, res *sip.Response) {
 
 // refuse2xx completes and tears down a dialog the far end believes it has
 // established but FreeSBC will not relay: ACK then BYE the first time, ACK
-// alone for a retransmission.
+// alone for a retransmission. Both keep the leg's creation-time carrier
+// identity, so an address retired after the INVITE still takes them.
 func (s *Server) refuse2xx(l *inviteLeg, res *sip.Response) {
+	carrier := l.dialog().carrierName()
 	if l.dialog().reject2xx(fsip.ToTag(res)) {
-		go s.ackThenBye(res, l.far)
+		go s.ackThenBye(res, l.far, carrier)
 		return
 	}
-	go s.ack2xx(res, l.far)
+	go s.ack2xx(res, l.far, carrier)
 }
 
 // errNoAnswer reports a 2xx that carries no SDP on a fork that never
@@ -354,13 +356,15 @@ func (s *Server) drainCancelledInvite(l *inviteLeg) {
 // ackThenBye completes and immediately tears down a dialog FreeSBC
 // accepted at the SIP layer but cannot anchor media for. RFC 3261 requires
 // a 2xx to be ACKed; without that the far end retransmits its 200 until
-// Timer H, and the dialog lingers either way. ACK, then BYE.
-func (s *Server) ackThenBye(res *sip.Response, from side) {
-	if !s.ack2xx(res, from) {
+// Timer H, and the dialog lingers either way. ACK, then BYE. carrier is the
+// dialog's creation-time carrier, "" for none, so both follow a carrier
+// address retired after the INVITE.
+func (s *Server) ackThenBye(res *sip.Response, from side, carrier string) {
+	if !s.ack2xx(res, from, carrier) {
 		return
 	}
 	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1, s.teardownOpts(from)...)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withCarrierRoute(context.Background(), carrier), 5*time.Second)
 	defer cancel()
 	clTx, err := s.clientTx(ctx, bye)
 	if err != nil {
@@ -376,9 +380,11 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 }
 
 // ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself.
-func (s *Server) ack2xx(res *sip.Response, from side) bool {
+// carrier is the creation-time carrier the ACK must keep when it has to
+// redial a retired address (empty for a non-carrier dialog).
+func (s *Server) ack2xx(res *sip.Response, from side, carrier string) bool {
 	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res), s.teardownOpts(from)...)
-	if err := s.writeRequest(ack); err != nil {
+	if err := s.writeRequestFor(ack, carrier); err != nil {
 		s.log.Debug("ack unanchorable answer", "err", err)
 		return false
 	}
@@ -465,7 +471,7 @@ func (s *Server) cancelCall(d *dialog, why cancelReason) bool {
 // call nobody is on.
 func (s *Server) sendCancel(a *inviteAttempt) {
 	cancelReq := fsip.BuildCancel(a.req)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(withCarrierRoute(context.Background(), a.carrier), 5*time.Second)
 	defer cancel()
 	clTx, err := s.clientTx(ctx, cancelReq)
 	a.cancel()
