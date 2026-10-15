@@ -48,6 +48,10 @@ type Server struct {
 	// Both are written once in New.
 	carriers    *carrierDirectory
 	carrierURIs map[string]string
+	// carrierPins is the carrier-generation table: creation-time carrier
+	// routes live dialogs co-own with the snapshot they were selected
+	// from (carrierpin.go). Written once in New.
+	carrierPins *carrierPins
 	// carrierByName holds each edge.carriers entry; carrierConns dials and
 	// pools the tcp and tls connections to them (carrierconn.go). Both are
 	// written once in New.
@@ -248,11 +252,22 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
 	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
 	s.dialogs = newDialogTable(s.metrics, s.log)
+	// The carrier generation table is owned by the dialog table; the
+	// Server keeps the same pointer so requireFlow can authorize a redial
+	// of a dialog's creation-time carrier route after a DNS refresh.
+	s.carrierPins = s.dialogs.pins
+	// When a retired route's last dialog ends, close the connection that
+	// served only that generation.
+	s.dialogs.onPinRetire = func(pin carrierPin) {
+		s.carrierConns.closeRetired(pin.carrier, pin.network, pin.dest)
+	}
 	s.subs = newSubTable(s.metrics)
 	// A subscription belongs to a registration binding: when the binding
 	// goes (un-REGISTER, WebSocket close, expiry) its records go too.
 	s.loc.SetOnRemove(s.subs.dropTokens)
-	s.dialogs.onMediaEnd = s.byeBothEnds
+	s.dialogs.onMediaEnd = func(d *dialog, why endReason, pin *carrierPin) {
+		s.byeBothEnds(d, why, pin)
+	}
 	if s.webrtcEnabled {
 		s.identity, err = media.ProcessDTLSIdentity()
 		if err != nil {

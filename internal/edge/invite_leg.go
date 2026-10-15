@@ -121,11 +121,14 @@ func (s *Server) onLate2xx(l *inviteLeg, res *sip.Response) {
 // established but FreeSBC will not relay: ACK then BYE the first time, ACK
 // alone for a retransmission.
 func (s *Server) refuse2xx(l *inviteLeg, res *sip.Response) {
+	// The far side is the leg the 2xx came from; when it is a carrier, the
+	// ACK/BYE follow the attempt's pinned generation.
+	route := s.dialogCarrierHint(l.dialog(), l.far)
 	if l.dialog().reject2xx(fsip.ToTag(res)) {
-		go s.ackThenBye(res, l.far)
+		go s.ackThenBye(res, l.far, route)
 		return
 	}
-	go s.ack2xx(res, l.far)
+	go s.ack2xx(res, l.far, route)
 }
 
 // errNoAnswer reports a 2xx that carries no SDP on a fork that never
@@ -354,15 +357,17 @@ func (s *Server) drainCancelledInvite(l *inviteLeg) {
 // ackThenBye completes and immediately tears down a dialog FreeSBC
 // accepted at the SIP layer but cannot anchor media for. RFC 3261 requires
 // a 2xx to be ACKed; without that the far end retransmits its 200 until
-// Timer H, and the dialog lingers either way. ACK, then BYE.
-func (s *Server) ackThenBye(res *sip.Response, from side) {
-	if !s.ack2xx(res, from) {
+// Timer H, and the dialog lingers either way. ACK, then BYE. route names
+// the pinned carrier when the far side is a carrier, so a redial keeps the
+// dialog's generation after a DNS refresh.
+func (s *Server) ackThenBye(res *sip.Response, from side, route carrierRouteHint) {
+	if !s.ack2xx(res, from, route) {
 		return
 	}
 	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1, s.teardownOpts(from)...)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.clientTx(ctx, bye)
+	clTx, err := s.clientTx(ctx, bye, route)
 	if err != nil {
 		s.log.Debug("bye unanchorable dialog", "err", err)
 		return
@@ -375,10 +380,11 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
 	}
 }
 
-// ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself.
-func (s *Server) ack2xx(res *sip.Response, from side) bool {
+// ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself. route
+// names the pinned carrier when the far side is a carrier leg.
+func (s *Server) ack2xx(res *sip.Response, from side, route carrierRouteHint) bool {
 	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res), s.teardownOpts(from)...)
-	if err := s.writeRequest(ack); err != nil {
+	if err := s.writeRequest(ack, route); err != nil {
 		s.log.Debug("ack unanchorable answer", "err", err)
 		return false
 	}
@@ -467,7 +473,10 @@ func (s *Server) sendCancel(a *inviteAttempt) {
 	cancelReq := fsip.BuildCancel(a.req)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.clientTx(ctx, cancelReq)
+	// The CANCEL follows the INVITE's own carrier generation, pinned on
+	// the attempt: a connection lost while the call rings is redialed as
+	// that carrier.
+	clTx, err := s.clientTx(ctx, cancelReq, carrierHint(a.carrier))
 	a.cancel()
 	if err != nil {
 		s.log.Debug("forward CANCEL", "err", err, "sip_call_id", fsip.CallID(a.req))

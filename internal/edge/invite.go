@@ -322,6 +322,12 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
 	defer d.endUnlessUp()
 	if carrier != "" {
 		d.setCarrier(carrier)
+		// Pin the carrier generation this call ARRIVED from: a mid-call
+		// BYE the proxy originates (or any other request toward the
+		// caller's carrier leg) keeps its carrier, transport and source
+		// address for the call's life, after any DNS refresh
+		// (carrierpin.go).
+		d.pinCarrier(carrier, from.transport, req.Source())
 	}
 	d.setSRTP(s.legSRTPPolicy(carrier, from.transport))
 

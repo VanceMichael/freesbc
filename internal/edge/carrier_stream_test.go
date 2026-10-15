@@ -171,8 +171,40 @@ type streamCarrier struct {
 	rtpPort int
 	ln      *countListener
 
+	// ringOnly makes the UAS answer INVITEs with just an 180 and end them
+	// 487 on CANCEL, instead of completing them — an early dialog.
+	ringOnly bool
+
 	mu   sync.Mutex
 	tags map[string]string // Call-ID → the To tag it answered with
+
+	// snis is the client SNI of every TLS connection accepted, in order.
+	sniMu sync.Mutex
+	snis  []string
+}
+
+// snisObserved returns the client SNI of every TLS handshake, in order.
+// It is captured from the ClientHello (GetConfigForClient): the connection's
+// own ConnectionState does not reliably retain the name.
+func (sc *streamCarrier) snisObserved() []string {
+	sc.sniMu.Lock()
+	defer sc.sniMu.Unlock()
+	return append([]string(nil), sc.snis...)
+}
+
+// withSNIRecord makes a TLS server config record the client SNI of every
+// ClientHello it answers, preserving the rest of the config.
+func withSNIRecord(conf *tls.Config, record func(string)) *tls.Config {
+	clone := conf.Clone()
+	prev := clone.GetConfigForClient
+	clone.GetConfigForClient = func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+		record(hi.ServerName)
+		if prev != nil {
+			return prev(hi)
+		}
+		return nil, nil
+	}
+	return clone
 }
 
 // startStreamCarrier serves transport (tcp, or tls with serverConf) on a
@@ -193,7 +225,15 @@ func startStreamCarrier(t *testing.T, transport string, serverConf, clientConf *
 	sc.ln = &countListener{Listener: raw}
 	var ln net.Listener = sc.ln
 	if transport == "tls" {
-		ln = tls.NewListener(sc.ln, serverConf)
+		conf := serverConf
+		if conf != nil {
+			conf = withSNIRecord(serverConf, func(sni string) {
+				sc.sniMu.Lock()
+				sc.snis = append(sc.snis, sni)
+				sc.sniMu.Unlock()
+			})
+		}
+		ln = tls.NewListener(sc.ln, conf)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	tl := sc.srv.TransportLayer()
@@ -224,6 +264,17 @@ func (sc *streamCarrier) answer(req *sip.Request, tx sip.ServerTransaction) {
 		sc.mu.Lock()
 		sc.tags[fsip.CallID(req)] = tag
 		sc.mu.Unlock()
+		if sc.ringOnly {
+			// A gateway that rings forever: an early dialog. sipgo answers
+			// the matched CANCEL 200 itself; the INVITE gets its 487 here.
+			r := sip.NewResponseFromRequest(req, 180, "Ringing", nil)
+			r.To().Params.Add("tag", tag)
+			_ = tx.Respond(r)
+			tx.OnCancel(func(*sip.Request) {
+				_ = tx.Respond(sip.NewResponseFromRequest(req, 487, "Request Terminated", nil))
+			})
+			return
+		}
 		body := fmt.Sprintf("v=0\r\no=gw 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
 			"m=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n", sc.rtpPort)
 		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(body))

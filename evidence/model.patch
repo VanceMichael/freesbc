@@ -1,0 +1,1955 @@
+diff --git a/internal/edge/carrier.go b/internal/edge/carrier.go
+index 43ffe78..e79fc6d 100644
+--- a/internal/edge/carrier.go
++++ b/internal/edge/carrier.go
+@@ -218,6 +218,12 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
+ 	}
+ 	defer d.endUnlessUp()
+ 	d.setCarrier(carrier)
++	// Pin the carrier generation this call is selected from: the new
++	// INVITE goes to the current snapshot's dest, and every later
++	// in-dialog request — including a CANCEL or teardown while still
++	// early — keeps this carrier, transport and remote for the call's
++	// life, after any DNS refresh (carrierpin.go).
++	d.pinCarrier(carrier, to.transport, dest)
+ 	d.setSRTP(s.legSRTPPolicy(carrier, ""))
+ 
+ 	// An offerless INVITE is forwarded as it is: the offer is the
+@@ -271,13 +277,13 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
+ 	}) {
+ 		return
+ 	}
+-	a := &inviteAttempt{req: out, cancel: cancel}
++	a := &inviteAttempt{req: out, cancel: cancel, carrier: carrier}
+ 	if !d.track(a) {
+ 		return
+ 	}
+ 	defer d.untrack()
+ 
+-	clTx, err := s.clientTx(ctx, out)
++	clTx, err := s.clientTx(ctx, out, carrierHint(carrier))
+ 	if err != nil {
+ 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)
+ 		s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
+@@ -323,7 +329,7 @@ func (s *Server) optionsToCarrier(req *sip.Request, tx sip.ServerTransaction, ca
+ 			stripBody(res)
+ 		}
+ 		return nil
+-	}); err != nil {
++	}, carrierHint(carrier)); err != nil {
+ 		s.log.Debug("forward carrier OPTIONS", "err", err, "carrier", carrier)
+ 		if ctx.Err() != nil {
+ 			s.reject(req, tx, 504, "Server Time-out")
+diff --git a/internal/edge/carrier_generation_test.go b/internal/edge/carrier_generation_test.go
+new file mode 100644
+index 0000000..82aec2f
+--- /dev/null
++++ b/internal/edge/carrier_generation_test.go
+@@ -0,0 +1,518 @@
++package edge
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/emiago/sipgo/sip"
++
++	fsip "github.com/freesbc/freesbc/internal/sip"
++)
++
++// This file proves the carrier generation contract over real loopback
++// TLS carriers (carrierpin.go):
++//
++//   - after a DNS refresh a NEW transaction is selected from the new
++//     snapshot only, while an existing dialog's requests stay on its
++//     creation-time carrier identity, transport and remote;
++//   - once the old connection is gone, ACK/UPDATE/BYE and an early-dialog
++//     CANCEL re-dial the OLD remote with the SAME carrier TLS/SNI/CA;
++//   - the retired route is reclaimed when its last dialog ends, and the old
++//     address can neither be dialed for a new transaction nor borrow another
++//     carrier's identity;
++//   - one address moving between two carriers keeps each dialog's TLS
++//     attribution.
++//
++// The carriers resolve through SRV, so a refresh can move the gateway port
++// (RFC 3263): the carrier host is a name, every SRV target is 127.0.0.1.
++
++const genCarrierHost = "sip.carrier.test"
++
++// genGateway is one fake carrier gateway with its port and observed SNIs.
++type genGateway struct {
++	sc   *streamCarrier
++	addr string
++}
++
++// genRig is an edge with one (or two) TLS carrier(s) resolved through a
++// controllable DNS stub.
++type genRig struct {
++	*harness
++	fs   *fakeSwitch
++	stub *dnsStub
++}
++
++func genSRV(port int) []*net.SRV {
++	return []*net.SRV{{Target: "gw.carrier.test.", Port: uint16(port), Priority: 10, Weight: 1}}
++}
++
++// genLeaf is issued for every name a generation-test carrier can be called.
++func genLeaf(t *testing.T, pki *testPKI) leaf {
++	t.Helper()
++	return pki.issue(false, []string{genCarrierHost, "sip.alpha.test", "sip.beta.test"})
++}
++
++func startGenGateway(t *testing.T, pki *testPKI) *genGateway {
++	t.Helper()
++	sc := startStreamCarrier(t, "tls", tlsServerConf(genLeaf(t, pki)), insecureClient())
++	return &genGateway{sc: sc, addr: fmt.Sprintf("127.0.0.1:%d", sc.port)}
++}
++
++// genCarrierYAML renders the carriers block for the given carrier host
++// names (all tls, the same test CA).
++func genCarrierYAML(names []string, caFile string) string {
++	var b strings.Builder
++	for _, n := range names {
++		fmt.Fprintf(&b, "    %s: {host: %q, transport: tls, ca_file: %q}\n", n, n, caFile)
++	}
++	return "edge:\n  carriers:\n" + b.String()
++}
++
++// startGenRig builds the rig with the given carrier hosts and initial SRV
++// map.
++func startGenRig(t *testing.T, names []string, srv map[string][]*net.SRV, pki *testPKI) *genRig {
++	t.Helper()
++	pubUDP, priv, up := freePort(t), freePort(t), freePort(t)
++	mediaBase := nextMediaBase(t)
++	yaml := harnessYAML(t, []string{fmt.Sprintf("127.0.0.1:%d", up)}, pubUDP, 0, 0, mediaBase, "")
++	block := genCarrierYAML(names, pki.caFile())
++	yaml = strings.Replace(yaml, "edge:\n", block, 1)
++	h := newHarness(t, yaml, priv)
++	h.upstream = fmt.Sprintf("127.0.0.1:%d", up)
++	h.fs = startFakeSwitch(t, h.upstream)
++	stub := &dnsStub{srv: srv, ips: map[string][]string{"gw.carrier.test": {"127.0.0.1"}}}
++	h.srv.carriers.lookupSRV, h.srv.carriers.lookupIP = stub.lookupSRV, stub.lookupIP
++	h.run()
++	for _, n := range names {
++		waitFor(t, 5*time.Second, "carrier "+n+" to resolve", func() bool {
++			_, ok := h.srv.carrierDest(n)
++			return ok
++		})
++	}
++	return &genRig{harness: h, fs: h.fs, stub: stub}
++}
++
++// refreshCarrierDNS expires the directory cache, mutates the stub and
++// refreshes synchronously: the test's deterministic DNS refresh.
++func (r *genRig) refreshCarrierDNS(t *testing.T, mutate func()) {
++	t.Helper()
++	d := r.srv.carriers
++	d.mu.Lock()
++	for _, e := range d.entries {
++		e.expiry = time.Time{}
++	}
++	d.mu.Unlock()
++	mutate()
++	d.refresh(context.Background())
++}
++
++func (r *genRig) waitDest(t *testing.T, carrier, addr string) {
++	t.Helper()
++	waitFor(t, 5*time.Second, fmt.Sprintf("carrier %s at %s", carrier, addr), func() bool {
++		dest, ok := r.srv.carrierDest(carrier)
++		return ok && dest == addr
++	})
++}
++
++// callCarrier has the switch place a call to a carrier host and complete
++// it, returning the 200 and the INVITE the gateway saw.
++func (r *genRig) callCarrier(t *testing.T, gw *genGateway, host string) *sip.Response {
++	t.Helper()
++	ruri := sip.Uri{User: "+442071234567", Host: host, Port: 5060}
++	res := r.fs.call(t, ruri, r.privateSIP, phoneOfferSDP(r.fs.rtpPort))
++	if res.StatusCode != 200 {
++		t.Fatalf("switch INVITE to the carrier: got %d, want 200", res.StatusCode)
++	}
++	gw.sc.waitInbound(t, sip.INVITE)
++	r.fs.sendAckTo2xx(t, res)
++	gw.sc.waitInbound(t, sip.ACK)
++	return res
++}
++
++// uacRequest sends an in-dialog non-INVITE request from the switch (the
++// caller of the call res is the 200 of), like uacBye for BYE.
++func (r *genRig) uacRequest(t *testing.T, method sip.RequestMethod, res *sip.Response) *sip.Response {
++	t.Helper()
++	f := r.fs
++	req := sip.NewRequest(method, res.To().Address)
++	sip.CopyHeaders("From", res, req)
++	sip.CopyHeaders("To", res, req)
++	sip.CopyHeaders("Call-ID", res, req)
++	seq := uint32(1)
++	if c := res.CSeq(); c != nil {
++		seq = c.SeqNo
++	}
++	req.AppendHeader(&sip.CSeqHeader{SeqNo: seq + 1, MethodName: method})
++	mf := sip.MaxForwardsHeader(70)
++	req.AppendHeader(&mf)
++	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "3003", Host: hostOf(f.addr), Port: portOf(f.addr)}})
++	copyRouteFromRecordRoute(res, req)
++	via := &sip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
++		Host: hostOf(f.addr), Port: portOf(f.addr), Params: sip.NewParams()}
++	via.Params.Add("branch", sip.GenerateBranchN(16))
++	req.PrependHeader(via)
++	req.SetTransport("UDP")
++	req.SetDestination(f.inDialogDest(t, req, res))
++	req.Laddr = sip.Addr{IP: net.ParseIP(hostOf(f.addr)), Port: portOf(f.addr)}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	tx, err := f.cli.TransactionRequest(ctx, req)
++	if err != nil {
++		t.Fatalf("fake switch %s: %v", method, err)
++	}
++	defer tx.Terminate()
++	for {
++		select {
++		case rr, ok := <-tx.Responses():
++			if !ok {
++				t.Fatalf("fake switch %s: no final response", method)
++			}
++			if rr.StatusCode >= 200 {
++				return rr
++			}
++		case <-tx.Done():
++			t.Fatalf("fake switch %s: %v", method, tx.Err())
++		case <-ctx.Done():
++			t.Fatalf("fake switch %s timed out", method)
++		}
++	}
++}
++
++// fsCancel cancels an INVITE the switch placed with callAsync.
++func (r *genRig) fsCancel(t *testing.T, req *sip.Request) *sip.Response {
++	t.Helper()
++	cancel := fsip.BuildCancel(req)
++	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel2()
++	tx, err := r.fs.cli.TransactionRequest(ctx, cancel)
++	if err != nil {
++		t.Fatalf("fake switch CANCEL: %v", err)
++	}
++	defer tx.Terminate()
++	for {
++		select {
++		case res, ok := <-tx.Responses():
++			if !ok {
++				t.Fatal("fake switch CANCEL: no final response")
++			}
++			if res.StatusCode >= 200 {
++				return res
++			}
++		case <-tx.Done():
++			t.Fatalf("fake switch CANCEL: %v", tx.Err())
++		case <-ctx.Done():
++			t.Fatal("fake switch CANCEL timed out")
++		}
++	}
++}
++
++// waitConnPooledGone waits until sipgo's pool holds no connection to addr.
++func (r *genRig) waitConnPooledGone(t *testing.T, addr string) {
++	t.Helper()
++	waitFor(t, 5*time.Second, "the pooled connection to "+addr+" to go", func() bool {
++		c, err := r.srv.srv.TransportLayer().GetConnection("tls", addr)
++		if err == nil && c != nil {
++			_, _ = c.TryClose()
++			return false
++		}
++		return true
++	})
++}
++
++// probeOldDial asks requireFlow whether it would serve a fresh request to a
++// retired address: with no pinned dialog it must refuse (errNoFlow).
++func (r *genRig) probeOldDial(t *testing.T, addr string) error {
++	t.Helper()
++	req := sip.NewRequest(sip.OPTIONS, sip.Uri{Host: "probe.invalid", Port: 1})
++	req.SetTransport("TLS")
++	req.SetDestination(addr)
++	return r.srv.requireFlow(context.Background(), req)
++}
++
++// After a successful refresh, NEW transactions take the new snapshot only;
++// the established dialog keeps its first remote, reusing its connection;
++// and the retired state is reclaimed with the dialogs.
++func TestCarrierGenerationNewTransactionsUseSnapshotOldDialogKeepsRoute(t *testing.T) {
++	pki := newTestPKI(t)
++	gw1 := startGenGateway(t, pki)
++	r := startGenRig(t, []string{genCarrierHost},
++		map[string][]*net.SRV{genCarrierHost: genSRV(gw1.sc.port)}, pki)
++	gw2 := startGenGateway(t, pki)
++
++	res1 := r.callCarrier(t, gw1, genCarrierHost)
++	if n := gw1.sc.ln.accepted(); n != 1 {
++		t.Fatalf("gateway 1 accepted %d connections, want 1", n)
++	}
++
++	// Refresh moves the carrier onto gateway 2.
++	r.refreshCarrierDNS(t, func() {
++		r.stub.srv[genCarrierHost] = genSRV(gw2.sc.port)
++	})
++	r.waitDest(t, genCarrierHost, gw2.addr)
++	// Both gateways are 127.0.0.1 in the lab, so the source set keeps the
++	// IP; the per IP:port admission — what a new dial is selected from — is
++	// what must have moved, and the old dialog keeps its own pin.
++	if name, ok := r.srv.carrierTarget("tls", gw1.addr); ok {
++		t.Errorf("the retired address still resolves to %q for a new dial", name)
++	}
++	if n := r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()); n != 1 {
++		t.Errorf("retiredCount = %d, want 1", n)
++	}
++
++	// A mid-dialog UPDATE on the old call rides the original connection.
++	if res := r.uacRequest(t, sip.UPDATE, res1); res.StatusCode != 200 {
++		t.Fatalf("in-dialog UPDATE: got %d, want 200", res.StatusCode)
++	}
++	gw1.sc.waitInbound(t, sip.UPDATE)
++	if n := gw1.sc.ln.accepted(); n != 1 {
++		t.Errorf("gateway 1 accepted %d connections, want the old one reused", n)
++	}
++
++	// A NEW call is selected from the new snapshot.
++	res2 := r.callCarrier(t, gw2, genCarrierHost)
++	if n := gw2.sc.ln.accepted(); n != 1 {
++		t.Errorf("gateway 2 accepted %d connections, want the new call", n)
++	}
++
++	// Each BYE goes to its own dialog's gateway, over the reused connection.
++	if bye := r.fs.uacBye(t, res1); bye.StatusCode != 200 {
++		t.Fatalf("BYE of the old call: got %d, want 200", bye.StatusCode)
++	}
++	gw1.sc.waitInbound(t, sip.BYE)
++	if n := gw1.sc.ln.accepted(); n != 1 {
++		t.Errorf("gateway 1 accepted %d connections, want the old one kept", n)
++	}
++	if bye := r.fs.uacBye(t, res2); bye.StatusCode != 200 {
++		t.Fatalf("BYE of the new call: got %d, want 200", bye.StatusCode)
++	}
++	gw2.sc.waitInbound(t, sip.BYE)
++	waitForRelease(t, r.harness)
++	if n := r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()); n != 0 {
++		t.Errorf("retiredCount after both calls ended = %d, want 0", n)
++	}
++}
++
++// With the old connection lost, an in-dialog UPDATE and BYE re-dial the OLD
++// remote with the pinned carrier's TLS (SNI/CA), and after the dialog ends
++// the retired address refuses a fresh dial.
++func TestCarrierGenerationRedialAfterFlowLost(t *testing.T) {
++	pki := newTestPKI(t)
++	gw1 := startGenGateway(t, pki)
++	r := startGenRig(t, []string{genCarrierHost},
++		map[string][]*net.SRV{genCarrierHost: genSRV(gw1.sc.port)}, pki)
++	gw2 := startGenGateway(t, pki)
++
++	res1 := r.callCarrier(t, gw1, genCarrierHost)
++	r.refreshCarrierDNS(t, func() {
++		r.stub.srv[genCarrierHost] = genSRV(gw2.sc.port)
++	})
++	r.waitDest(t, genCarrierHost, gw2.addr)
++	if n := r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()); n != 1 {
++		t.Fatalf("retiredCount = %d, want 1", n)
++	}
++
++	// The carrier drops the old connection; FreeSBC must notice and pool
++	// nothing for the old remote.
++	gw1.sc.ln.closeAccepted()
++	r.waitConnPooledGone(t, gw1.addr)
++
++	// A new call has already moved to gateway 2; the old dialog's UPDATE
++	// re-dials gateway 1 as alpha.
++	res2 := r.callCarrier(t, gw2, genCarrierHost)
++	if res := r.uacRequest(t, sip.UPDATE, res1); res.StatusCode != 200 {
++		t.Fatalf("UPDATE after the flow was lost: got %d, want 200", res.StatusCode)
++	}
++	gw1.sc.waitInbound(t, sip.UPDATE)
++	if n := gw1.sc.ln.accepted(); n != 2 {
++		t.Errorf("gateway 1 accepted %d connections, want a redial after the loss", n)
++	}
++	if snis := gw1.sc.snisObserved(); len(snis) != 2 || snis[0] != genCarrierHost || snis[1] != genCarrierHost {
++		t.Errorf("gateway 1 SNIs = %v, want two %q handshakes", snis, genCarrierHost)
++	}
++
++	// The BYE reuses the redialed connection (no third one).
++	if bye := r.fs.uacBye(t, res1); bye.StatusCode != 200 {
++		t.Fatalf("BYE after the flow was lost: got %d, want 200", bye.StatusCode)
++	}
++	gw1.sc.waitInbound(t, sip.BYE)
++	if n := gw1.sc.ln.accepted(); n != 2 {
++		t.Errorf("gateway 1 accepted %d connections, want the redial reused", n)
++	}
++	// Only the old call ends here; the new one (gateway 2) stays up.
++	waitFor(t, 5*time.Second, "the old call to end", func() bool {
++		return r.srv.dialogs.sessionCount() == 1
++	})
++	if n := r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()); n != 0 {
++		t.Errorf("retiredCount after the old call ended = %d, want 0", n)
++	}
++	// The retired connection is closed with the last pin; its pool entry
++	// leaves on the read loop, so wait before probing.
++	r.waitConnPooledGone(t, gw1.addr)
++	if err := r.probeOldDial(t, gw1.addr); !errors.Is(err, errNoFlow) {
++		t.Errorf("a fresh request to the retired address: err = %v, want errNoFlow", err)
++	}
++	if bye := r.fs.uacBye(t, res2); bye.StatusCode != 200 {
++		t.Fatalf("BYE of the new call: got %d, want 200", bye.StatusCode)
++	}
++	gw2.sc.waitInbound(t, sip.BYE)
++	waitForRelease(t, r.harness)
++}
++
++// An EARLY dialog's CANCEL follows its pinned generation: the connection
++// lost while the call rings is re-dialed to the old remote with the
++// carrier's TLS, the gateway sees the CANCEL, and the switch gets its 487.
++func TestCarrierGenerationEarlyCancelRedialsOldRemote(t *testing.T) {
++	pki := newTestPKI(t)
++	gw1 := startGenGateway(t, pki)
++	gw1.sc.ringOnly = true
++	r := startGenRig(t, []string{genCarrierHost},
++		map[string][]*net.SRV{genCarrierHost: genSRV(gw1.sc.port)}, pki)
++	gw2 := startGenGateway(t, pki)
++
++	req, final := r.fs.callAsync(t, sip.Uri{User: "+442071234567", Host: genCarrierHost, Port: 5060},
++		r.privateSIP, phoneOfferSDP(r.fs.rtpPort))
++	gw1.sc.waitInbound(t, sip.INVITE)
++
++	r.refreshCarrierDNS(t, func() {
++		r.stub.srv[genCarrierHost] = genSRV(gw2.sc.port)
++	})
++	r.waitDest(t, genCarrierHost, gw2.addr)
++	gw1.sc.ln.closeAccepted()
++	r.waitConnPooledGone(t, gw1.addr)
++
++	if res := r.fsCancel(t, req); res.StatusCode != 200 {
++		t.Fatalf("CANCEL answer: got %d, want 200", res.StatusCode)
++	}
++	gw1.sc.waitInbound(t, sip.CANCEL)
++	if n := gw1.sc.ln.accepted(); n != 2 {
++		t.Errorf("gateway 1 accepted %d connections, want the CANCEL to redial", n)
++	}
++	if snis := gw1.sc.snisObserved(); len(snis) != 2 || snis[1] != genCarrierHost {
++		t.Errorf("the CANCEL redial SNIs = %v, want a second %q handshake", snis, genCarrierHost)
++	}
++	select {
++	case res := <-final:
++		if res == nil || res.StatusCode != 487 {
++			code := 0
++			if res != nil {
++				code = res.StatusCode
++			}
++			t.Fatalf("the switch's INVITE ended with %d, want 487", code)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("the switch never received the 487")
++	}
++	waitForRelease(t, r.harness)
++	if n := r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()); n != 0 {
++		t.Errorf("retiredCount after the cancelled call = %d, want 0", n)
++	}
++	r.waitConnPooledGone(t, gw1.addr)
++	if err := r.probeOldDial(t, gw1.addr); !errors.Is(err, errNoFlow) {
++		t.Errorf("a fresh request to the retired address: err = %v, want errNoFlow", err)
++	}
++}
++
++// A teardown the PROXY originates (the RTP-silence watchdog) on a retired
++// generation also re-dials the old remote with the pinned carrier's TLS, and
++// both ends get their BYE.
++func TestCarrierGenerationProxyTeardownRedialsOldRemote(t *testing.T) {
++	pki := newTestPKI(t)
++	gw1 := startGenGateway(t, pki)
++	r := startGenRig(t, []string{genCarrierHost},
++		map[string][]*net.SRV{genCarrierHost: genSRV(gw1.sc.port)}, pki)
++	gw2 := startGenGateway(t, pki)
++	// No RTP flows in the lab, so the watchdog ends the call on its own.
++	r.srv.setRTPTimeout(time.Second)
++
++	res := r.callCarrier(t, gw1, genCarrierHost)
++	// Once the call is up nothing here reads it; silence must still tear it
++	// down, so mark the switch answer seen and do not ACK again.
++	_ = res
++
++	r.refreshCarrierDNS(t, func() {
++		r.stub.srv[genCarrierHost] = genSRV(gw2.sc.port)
++	})
++	r.waitDest(t, genCarrierHost, gw2.addr)
++	gw1.sc.ln.closeAccepted()
++	r.waitConnPooledGone(t, gw1.addr)
++
++	// The watchdog's BYE to the carrier redials gateway 1 as alpha; the
++	// switch gets the matching BYE on its leg.
++	gw1.sc.waitInbound(t, sip.BYE)
++	if n := gw1.sc.ln.accepted(); n != 2 {
++		t.Errorf("gateway 1 accepted %d connections, want the teardown to redial", n)
++	}
++	if snis := gw1.sc.snisObserved(); len(snis) != 2 || snis[1] != genCarrierHost {
++		t.Errorf("gateway 1 SNIs = %v, want a second %q handshake", snis, genCarrierHost)
++	}
++	if got := r.fs.waitFor(sip.BYE, 1, 5*time.Second); len(got) != 1 {
++		t.Errorf("the switch saw %d BYEs from the proxy teardown, want 1", len(got))
++	}
++	waitForRelease(t, r.harness)
++	// The teardown BYEs run after end() under a temporary pin hold; wait
++	// for both sends to release it and reclaim the retired connection.
++	waitFor(t, 5*time.Second, "the teardown pin to be released", func() bool {
++		return r.srv.carrierPins.retiredCount(r.srv.carriers.snapshot()) == 0
++	})
++	r.waitConnPooledGone(t, gw1.addr)
++	if err := r.probeOldDial(t, gw1.addr); !errors.Is(err, errNoFlow) {
++		t.Errorf("a fresh request to the retired address: err = %v, want errNoFlow", err)
++	}
++}
++
++// An address that moves from carrier alpha to carrier beta keeps
++// deterministic TLS attribution: the alpha dialog re-dials with alpha's
++// SNI, the brand-new beta call dials the same address with beta's.
++func TestCarrierGenerationCrossCarrierIdentity(t *testing.T) {
++	pki := newTestPKI(t)
++	gwA := startGenGateway(t, pki)
++	gwC := startGenGateway(t, pki)
++	// beta's first-generation port is replaced before it is ever called, so
++	// no gateway needs to listen there.
++	srv := map[string][]*net.SRV{
++		// First generation: alpha at gateway A, beta elsewhere.
++		"sip.alpha.test": {{Target: "gw.carrier.test.", Port: uint16(gwA.sc.port), Priority: 10, Weight: 1}},
++		"sip.beta.test":  {{Target: "gw.carrier.test.", Port: uint16(1), Priority: 10, Weight: 1}},
++	}
++	r := startGenRig(t, []string{"sip.alpha.test", "sip.beta.test"}, srv, pki)
++	resAlpha := r.callCarrier(t, gwA, "sip.alpha.test")
++
++	// Second generation: alpha moves to C, and beta takes gateway A — the
++	// address the alpha dialog was created on.
++	r.refreshCarrierDNS(t, func() {
++		r.stub.srv["sip.alpha.test"][0].Port = uint16(gwC.sc.port)
++		r.stub.srv["sip.beta.test"][0].Port = uint16(gwA.sc.port)
++	})
++	r.waitDest(t, "sip.alpha.test", gwC.addr)
++	r.waitDest(t, "sip.beta.test", gwA.addr)
++
++	gwA.sc.ln.closeAccepted()
++	r.waitConnPooledGone(t, gwA.addr)
++
++	// The alpha dialog's BYE re-dials A as alpha...
++	if bye := r.fs.uacBye(t, resAlpha); bye.StatusCode != 200 {
++		t.Fatalf("alpha BYE after the move: got %d, want 200", bye.StatusCode)
++	}
++	gwA.sc.waitInbound(t, sip.BYE)
++	waitForRelease(t, r.harness)
++
++	// ...and the new beta call dials the SAME address as beta. Neither
++	// borrows the other's TLS session.
++	resBeta := r.callCarrier(t, gwA, "sip.beta.test")
++	if bye := r.fs.uacBye(t, resBeta); bye.StatusCode != 200 {
++		t.Fatalf("beta BYE: got %d, want 200", bye.StatusCode)
++	}
++	gwA.sc.waitInbound(t, sip.BYE)
++	// Three handshakes at gateway A: the alpha INVITE, the alpha BYE
++	// redial, and the beta INVITE — never one session carrying both names.
++	want := []string{"sip.alpha.test", "sip.alpha.test", "sip.beta.test"}
++	if got := gwA.sc.snisObserved(); len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
++		t.Errorf("gateway A SNIs = %v, want %v", got, want)
++	}
++}
+diff --git a/internal/edge/carrier_stream_test.go b/internal/edge/carrier_stream_test.go
+index 286aa27..297fb81 100644
+--- a/internal/edge/carrier_stream_test.go
++++ b/internal/edge/carrier_stream_test.go
+@@ -171,8 +171,40 @@ type streamCarrier struct {
+ 	rtpPort int
+ 	ln      *countListener
+ 
++	// ringOnly makes the UAS answer INVITEs with just an 180 and end them
++	// 487 on CANCEL, instead of completing them — an early dialog.
++	ringOnly bool
++
+ 	mu   sync.Mutex
+ 	tags map[string]string // Call-ID → the To tag it answered with
++
++	// snis is the client SNI of every TLS connection accepted, in order.
++	sniMu sync.Mutex
++	snis  []string
++}
++
++// snisObserved returns the client SNI of every TLS handshake, in order.
++// It is captured from the ClientHello (GetConfigForClient): the connection's
++// own ConnectionState does not reliably retain the name.
++func (sc *streamCarrier) snisObserved() []string {
++	sc.sniMu.Lock()
++	defer sc.sniMu.Unlock()
++	return append([]string(nil), sc.snis...)
++}
++
++// withSNIRecord makes a TLS server config record the client SNI of every
++// ClientHello it answers, preserving the rest of the config.
++func withSNIRecord(conf *tls.Config, record func(string)) *tls.Config {
++	clone := conf.Clone()
++	prev := clone.GetConfigForClient
++	clone.GetConfigForClient = func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
++		record(hi.ServerName)
++		if prev != nil {
++			return prev(hi)
++		}
++		return nil, nil
++	}
++	return clone
+ }
+ 
+ // startStreamCarrier serves transport (tcp, or tls with serverConf) on a
+@@ -193,7 +225,15 @@ func startStreamCarrier(t *testing.T, transport string, serverConf, clientConf *
+ 	sc.ln = &countListener{Listener: raw}
+ 	var ln net.Listener = sc.ln
+ 	if transport == "tls" {
+-		ln = tls.NewListener(sc.ln, serverConf)
++		conf := serverConf
++		if conf != nil {
++			conf = withSNIRecord(serverConf, func(sni string) {
++				sc.sniMu.Lock()
++				sc.snis = append(sc.snis, sni)
++				sc.sniMu.Unlock()
++			})
++		}
++		ln = tls.NewListener(sc.ln, conf)
+ 	}
+ 	t.Cleanup(func() { _ = ln.Close() })
+ 	tl := sc.srv.TransportLayer()
+@@ -224,6 +264,17 @@ func (sc *streamCarrier) answer(req *sip.Request, tx sip.ServerTransaction) {
+ 		sc.mu.Lock()
+ 		sc.tags[fsip.CallID(req)] = tag
+ 		sc.mu.Unlock()
++		if sc.ringOnly {
++			// A gateway that rings forever: an early dialog. sipgo answers
++			// the matched CANCEL 200 itself; the INVITE gets its 487 here.
++			r := sip.NewResponseFromRequest(req, 180, "Ringing", nil)
++			r.To().Params.Add("tag", tag)
++			_ = tx.Respond(r)
++			tx.OnCancel(func(*sip.Request) {
++				_ = tx.Respond(sip.NewResponseFromRequest(req, 487, "Request Terminated", nil))
++			})
++			return
++		}
+ 		body := fmt.Sprintf("v=0\r\no=gw 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n"+
+ 			"m=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n", sc.rtpPort)
+ 		res := sip.NewResponseFromRequest(req, 200, "OK", []byte(body))
+diff --git a/internal/edge/carrierconn.go b/internal/edge/carrierconn.go
+index e02ef35..cc41627 100644
+--- a/internal/edge/carrierconn.go
++++ b/internal/edge/carrierconn.go
+@@ -12,6 +12,8 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/emiago/sipgo/sip"
++
+ 	"github.com/freesbc/freesbc/internal/config"
+ )
+ 
+@@ -56,13 +58,22 @@ type carrierConns struct {
+ 
+ 	mu    sync.Mutex
+ 	locks map[string]*sync.Mutex // one dial at a time per destination
++
++	// dialed names the carrier each connection FreeSBC itself opened was
++	// established as, keyed by the connection's own local address, which is
++	// unique per connection. It is the identity check that keeps a
++	// connection dialed for carrier A from being reused for carrier B when
++	// a DNS refresh moves one address between them (carrierpin.go). A
++	// connection the carrier opened to FreeSBC is not recorded: it is
++	// reusable as the carrier address it came from, as before.
++	dialed map[string]string
+ }
+ 
+ // newCarrierConns builds the TLS configs of the tls carriers and the
+ // listeners for the tcp and tls ones.
+ func newCarrierConns(s *Server, cfg *config.Config) (*carrierConns, error) {
+ 	cc := &carrierConns{s: s, tls: map[string]*tls.Config{}, lis: map[string]*streamListener{},
+-		locks: map[string]*sync.Mutex{}}
++		locks: map[string]*sync.Mutex{}, dialed: map[string]string{}}
+ 	for _, c := range cfg.CarrierList() {
+ 		if c.Transport == config.CarrierUDP {
+ 			continue
+@@ -137,10 +148,14 @@ func (cc *carrierConns) destLock(dest string) *sync.Mutex {
+ 	return m
+ }
+ 
+-// carrierTarget names the tcp or tls carrier whose resolved address is dest,
+-// for a request leaving over network. It is the only case FreeSBC dials a
+-// stream connection: a client's flow is never dialed (requireFlow).
++// carrierTarget names the tcp or tls carrier whose resolved address is dest
++// in the CURRENT snapshot, for a request leaving over network. It is the
++// admission of a brand-new transaction's dial: a dialog's pinned generation
++// is answered by carrierPins before this is even consulted (requireFlow).
++// It is the only case FreeSBC dials a stream connection: a client's flow is
++// never dialed.
+ func (s *Server) carrierTarget(network, dest string) (string, bool) {
++	dest = canonicalPinDest(dest)
+ 	snap := s.carriers.snapshot()
+ 	for _, name := range snap.names {
+ 		if snap.transports[name] != network {
+@@ -155,15 +170,55 @@ func (s *Server) carrierTarget(network, dest string) (string, bool) {
+ 	return "", false
+ }
+ 
+-// ensure returns once sipgo's pool holds a connection to dest, dialing the
+-// carrier when it holds none. It does not hold a reference to it.
++// noteDialed records that the connection identified by its own local
++// address was opened as carrier. The connection's Close forgets it once.
++func (cc *carrierConns) noteDialed(localAddr, carrier string) {
++	cc.mu.Lock()
++	cc.dialed[localAddr] = carrier
++	cc.mu.Unlock()
++}
++
++func (cc *carrierConns) forgetDialed(localAddr string) {
++	cc.mu.Lock()
++	delete(cc.dialed, localAddr)
++	cc.mu.Unlock()
++}
++
++// dialedCarrier names the carrier a pooled connection FreeSBC itself opened
++// was established as. Empty means the connection was accepted from the
++// carrier, or is otherwise not one of our dials.
++func (cc *carrierConns) dialedCarrier(c sip.Connection) string {
++	cc.mu.Lock()
++	defer cc.mu.Unlock()
++	return cc.dialed[c.LocalAddr().String()]
++}
++
++// pooledFor reports whether the pooled connection to dest may serve name:
++// none pooled (a dial is needed), or the pool holds a connection that is
++// reusable for that carrier — one accepted from the carrier, or one dialed
++// as that very carrier. A connection dialed for a DIFFERENT carrier (an
++// address that moved between carriers) must not be reused: the TLS session
++// carries the other carrier's name and certificate.
++func (cc *carrierConns) pooledFor(tl *sip.TransportLayer, name, network, dest string) (pooled, reusable bool) {
++	c, err := tl.GetConnection(network, dest)
++	if err != nil || c == nil {
++		return false, false
++	}
++	owner := cc.dialedCarrier(c)
++	_, _ = c.TryClose() // GetConnection took a reference; hand it back
++	return true, owner == "" || owner == name
++}
++
++// ensure returns once sipgo's pool holds a connection to dest that is
++// reusable for name, dialing the carrier when it holds none or only a
++// connection another carrier established. It does not hold a reference to
++// it.
+ func (cc *carrierConns) ensure(ctx context.Context, name, network, dest string) error {
+ 	m := cc.destLock(dest)
+ 	m.Lock()
+ 	defer m.Unlock()
+ 	tl := cc.s.srv.TransportLayer()
+-	if c, err := tl.GetConnection(network, dest); err == nil && c != nil {
+-		_, _ = c.TryClose()
++	if pooled, reusable := cc.pooledFor(tl, name, network, dest); pooled && reusable {
+ 		return nil
+ 	}
+ 	err := cc.dial(ctx, name, network, dest)
+@@ -173,14 +228,15 @@ func (cc *carrierConns) ensure(ctx context.Context, name, network, dest string)
+ 		return err
+ 	}
+ 	// The connection is in sipgo's pool once its Serve loop has taken it
+-	// from the listener, a moment after the hand-over.
++	// from the listener, a moment after the hand-over. Wait for OURS: a
++	// connection another carrier established to the same address may sit in
++	// the pool beside it.
+ 	deadline := time.NewTimer(2 * time.Second)
+ 	defer deadline.Stop()
+ 	tick := time.NewTicker(time.Millisecond)
+ 	defer tick.Stop()
+ 	for {
+-		if c, err := tl.GetConnection(network, dest); err == nil && c != nil {
+-			_, _ = c.TryClose()
++		if pooled, reusable := cc.pooledFor(tl, name, network, dest); pooled && reusable {
+ 			return nil
+ 		}
+ 		select {
+@@ -193,6 +249,31 @@ func (cc *carrierConns) ensure(ctx context.Context, name, network, dest string)
+ 	}
+ }
+ 
++// closeRetired reclaims the connection a reclaimed generation pin served:
++// when a carrier route's last dialog ends and the current snapshot no longer
++// publishes that carrier at that remote, the pooled connection dialed AS
++// that carrier is closed, so a retired address keeps no socket of its own.
++// A connection another carrier now owns (the address moved), a connection
++// the carrier opened, and a route the snapshot still publishes are left
++// alone.
++func (cc *carrierConns) closeRetired(name, network, dest string) {
++	if current, ok := cc.s.carrierTarget(network, dest); ok && current == name {
++		return // still a current route: ordinary pool retention applies
++	}
++	tl := cc.s.srv.TransportLayer()
++	c, err := tl.GetConnection(network, dest)
++	if err != nil || c == nil {
++		return
++	}
++	if owner := cc.dialedCarrier(c); owner != "" && owner != name {
++		_, _ = c.TryClose() // hand the GetConnection reference back
++		return
++	}
++	cc.s.log.Debug("closing connection of a retired carrier route",
++		"carrier", name, "transport", network, "dest", dest)
++	_ = c.Close()
++}
++
+ // dial opens, handshakes and hands over one connection to a carrier.
+ func (cc *carrierConns) dial(ctx context.Context, name, network, dest string) error {
+ 	s := cc.s
+@@ -223,6 +304,13 @@ func (cc *carrierConns) dial(ctx context.Context, name, network, dest string) er
+ 		return fmt.Errorf("connection cap reached (%s)", streamRefusalLabels[why])
+ 	}
+ 	c := &streamConn{Conn: raw, l: l, ap: ap, remote: dest, lim: lim, fr: &sipFramer{max: lim.maxMessage}, carrier: true}
++	// Record who this connection belongs to before it can be pooled, so a
++	// request that finds it the instant it appears gets the carrier check
++	// right; Close forgets it. Keyed by the connection's own local
++	// address, which distinguishes two connections to one remote address.
++	local := raw.LocalAddr().String()
++	cc.noteDialed(local, name)
++	c.onClose = func() { cc.forgetDialed(local) }
+ 	s.metrics.StreamConnOpened(network)
+ 	if network == config.CarrierTLS {
+ 		tc := tls.Client(raw, cc.tls[name])
+diff --git a/internal/edge/carrierpin.go b/internal/edge/carrierpin.go
+new file mode 100644
+index 0000000..b7089af
+--- /dev/null
++++ b/internal/edge/carrierpin.go
+@@ -0,0 +1,222 @@
++package edge
++
++import (
++	"net/netip"
++	"sync"
++)
++
++// This file is the carrier address GENERATION table: the co-ownership, by
++// the carrier directory's snapshot generation and the dialogs created from
++// it, of a carrier route captured when a call begins.
++//
++// A successful DNS refresh swaps the directory snapshot atomically: a new
++// out-of-dialog transaction is selected from the new snapshot only
++// (carrierDest, carrierTarget), and an address the snapshot retired can
++// never be admitted into a new transaction again — not by selection and not
++// by borrowing a dialog that still runs. A dialog, however, was answered on
++// the generation it was created with: its ACK, BYE, PRACK, UPDATE, INFO and
++// NOTIFY, their retransmissions, a CANCEL while it is early and the BYEs the
++// proxy itself originates must keep the creation-time carrier identity,
++// transport and remote address for the dialog's whole life. The pooled
++// stream connection is reused while it lives; once it is lost, the pinned
++// carrier name is what the redial is made with — that carrier's TLS server
++// name, root set and client certificate — even when the same address has
++// since moved to another carrier, or out of the snapshot altogether.
++//
++// UDP has no pin: there is no connection to reuse or re-establish, so a
++// datagram keeps going to the dialog's remote with no state here. A
++// carrier_sources-only match (carrier "unknown") is not pinned either: it is
++// not a configured carrier FreeSBC could dial or name a TLS config for.
++//
++// One pin is acquired per carrier dialog, right after the record opens and
++// before anything is sent, and released exactly once in the dialog's single
++// end() transition — so CANCEL, a non-2xx, a timeout, a media failure, BYE,
++// shutdown and concurrent endings all have one deterministic owner and an
++// idempotent release. When the last dialog holding a retired route ends,
++// its state is reclaimed and the old address dials no more.
++
++// carrierPin is one carrier route a dialog captured at creation: the
++// edge.carriers name, the stream network ("tcp"/"tls") and the canonical
++// remote "IP:port".
++type carrierPin struct {
++	carrier string
++	network string
++	dest    string
++}
++
++// carrierPins is the reference-counted set of carrier routes live dialogs
++// captured. A triple's reference count is the number of live dialogs on it.
++// The same (carrier, network, dest) that the current snapshot still
++// publishes is held here too: the pin — never the snapshot — answers for a
++// dialog for its whole life, which is what keeps its attribution stable
++// across a refresh that moves the address to another carrier and back.
++type carrierPins struct {
++	mu   sync.Mutex
++	refs map[carrierPin]int
++}
++
++func newCarrierPins() *carrierPins {
++	return &carrierPins{refs: map[carrierPin]int{}}
++}
++
++// retain records one owner of pin. Callers hold the dialog table lock (the
++// table lock is always taken before this one), so retain and release are
++// atomic with the dialog's own state transition.
++func (p *carrierPins) retain(pin carrierPin) {
++	p.mu.Lock()
++	p.refs[pin]++
++	p.mu.Unlock()
++}
++
++// release drops one owner of pin and reports whether it reclaimed the
++// route (the last owner went). It balances exactly one retain. The table
++// that owns the registry fires its onPinRetire hook only on a true report,
++// outside the table lock.
++func (p *carrierPins) release(pin carrierPin) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	n, existed := p.refs[pin]
++	if !existed {
++		return false
++	}
++	if n > 1 {
++		p.refs[pin] = n - 1
++		return false
++	}
++	// The last owner goes: the retired route is reclaimed.
++	delete(p.refs, pin)
++	return true
++}
++
++// allows reports whether a live dialog pins exactly carrier at dest over
++// network. It is the dial authorization for in-dialog traffic: the carrier
++// named must be the one that owned the address when the dialog was created.
++func (p *carrierPins) allows(carrier, network, dest string) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.refs[carrierPin{carrier: carrier, network: network, dest: canonicalPinDest(dest)}] > 0
++}
++
++// pinsRemote reports whether any live dialog's carrier route ends at dest
++// over network, whatever the carrier: a connection to it carries a call and
++// must not be reaped for being quiet while the dialog is still early (a
++// confirmed dialog is protected through dialogTable.usesRemote as well).
++func (p *carrierPins) pinsRemote(network, dest string) bool {
++	dest = canonicalPinDest(dest)
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for pin := range p.refs {
++		if pin.network == network && pin.dest == dest {
++			return true
++		}
++	}
++	return false
++}
++
++// retiredCount is how many pinned routes the given snapshot no longer
++// publishes for their carrier: the state waiting on its last dialog before
++// reclamation. Tests and diagnostics use it; new transactions never read it.
++func (p *carrierPins) retiredCount(snap *carrierSnapshot) int {
++	current := map[carrierPin]bool{}
++	if snap != nil {
++		for name, addrs := range snap.addrs {
++			network := snap.transports[name]
++			if streamIndex(network) < 0 {
++				continue
++			}
++			for _, a := range addrs {
++				current[carrierPin{carrier: name, network: network, dest: a.String()}] = true
++			}
++		}
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	n := 0
++	for pin := range p.refs {
++		if !current[pin] {
++			n++
++		}
++	}
++	return n
++}
++
++// canonicalPinDest renders a destination as the registry keys it: the
++// canonical "IP:port" netip form (an IPv6 address bracketed, a mapped v4
++// address unmapped), leaving a value that is not an IP:port untouched so a
++// malformed destination simply never matches.
++func canonicalPinDest(dest string) string {
++	if a, err := netip.ParseAddrPort(dest); err == nil {
++		// Unmap, as the rest of the carrier code does: an IPv4-mapped IPv6
++		// socket address and the v4 form are one destination.
++		a = netip.AddrPortFrom(a.Addr().Unmap().WithZone(""), a.Port())
++		return a.String()
++	}
++	return dest
++}
++
++// holdPinForTeardown takes a temporary extra reference to the dialog's
++// carrier pin for a teardown that runs AFTER end() detached the record — the
++// BYEs FreeSBC originates itself when it ends the call (a media timeout, an
++// answer it could not anchor). end() then releases the dialog's own
++// reference while this hold keeps the route authorized; the teardown
++// releases it when the BYEs are sent. nil for a dialog with no carrier pin.
++// It must be taken before end().
++func (d *dialog) holdPinForTeardown() *carrierPin {
++	t := d.tab
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if d.pin == nil {
++		return nil
++	}
++	pin := *d.pin
++	t.pins.retain(pin)
++	return &pin
++}
++
++// pinCarrier captures this dialog's creation-time carrier route: the
++// carrier, the stream transport and the remote the carrier leg was opened
++// with. It is taken once, before the dialog's first request is sent, and
++// lives until end(). A non-stream transport, no carrier and the "unknown"
++// carrier_source match take no pin. A dialog that has already ended (a
++// shutdown racing setup) takes none either: its end() has nothing to
++// release.
++func (d *dialog) pinCarrier(carrier, network, dest string) {
++	if streamIndex(network) < 0 || carrier == "" || carrier == carrierUnknown || dest == "" {
++		return
++	}
++	pin := carrierPin{carrier: carrier, network: network, dest: canonicalPinDest(dest)}
++	t := d.tab
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if d.state == dialogEnded || d.pin != nil {
++		return
++	}
++	d.pin = &pin
++	t.pins.retain(pin)
++}
++
++// carrierRouteHint is the routing hint a send carries toward a carrier: the
++// carrier the connection must be made as when no pooled one exists. The zero
++// value means "no pinned carrier; resolve the current snapshot". It is set
++// for traffic on a recorded carrier dialog toward its public side and for
++// fresh carrier transactions; a hint alone authorizes nothing — requireFlow
++// re-checks the pin or the snapshot.
++type carrierRouteHint struct {
++	name string
++}
++
++func carrierHint(name string) carrierRouteHint {
++	if name == "" || name == carrierUnknown {
++		return carrierRouteHint{}
++	}
++	return carrierRouteHint{name: name}
++}
++
++// dialogCarrierHint is the carrier routing hint for traffic headed to side
++// to on d's behalf: set toward a carrier dialog's public side only.
++func (s *Server) dialogCarrierHint(d *dialog, to side) carrierRouteHint {
++	if d == nil || to.plane != planePublic {
++		return carrierRouteHint{}
++	}
++	return carrierHint(d.carrierName())
++}
+diff --git a/internal/edge/carrierpin_test.go b/internal/edge/carrierpin_test.go
+new file mode 100644
+index 0000000..747961d
+--- /dev/null
++++ b/internal/edge/carrierpin_test.go
+@@ -0,0 +1,248 @@
++package edge
++
++import (
++	"io"
++	"log/slog"
++	"net/netip"
++	"sync"
++	"testing"
++
++	"github.com/emiago/sipgo/sip"
++)
++
++// This file tests the carrier generation table (carrierpin.go): what a
++// dialog pins at creation, what a later send may dial, and when the retired
++// state is reclaimed. The socket-level behaviour is in
++// carrier_generation_test.go.
++
++func newPinDialog(t *testing.T, tab *dialogTable, callID string) *dialog {
++	t.Helper()
++	req := sip.NewRequest(sip.INVITE, sip.Uri{User: "2002", Host: "example.com"})
++	from := &sip.FromHeader{Address: sip.Uri{User: "1001", Host: "example.com"}, Params: sip.NewParams()}
++	from.Params.Add("tag", "caller-"+callID)
++	req.AppendHeader(from)
++	req.AppendHeader(&sip.ToHeader{Address: sip.Uri{User: "2002", Host: "example.com"}, Params: sip.NewParams()})
++	cid := sip.CallIDHeader(callID)
++	req.AppendHeader(&cid)
++	req.AppendHeader(&sip.CSeqHeader{SeqNo: 1, MethodName: sip.INVITE})
++	d, res := tab.begin(req, planePrivate, 0)
++	if res != beginOK {
++		t.Fatalf("begin = %v", res)
++	}
++	return d
++}
++
++func newPinTable() *dialogTable {
++	return newDialogTable(NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
++}
++
++// A pin authorizes exactly the (carrier, transport, remote) triple the
++// dialog captured; another carrier, transport or address gets nothing. The
++// retired state counts only routes the snapshot no longer publishes, and it
++// is reclaimed with the last dialog.
++func TestCarrierPinsAuthorizationAndReclamation(t *testing.T) {
++	tab := newPinTable()
++	pins := tab.pins
++	snap := &carrierSnapshot{
++		names:      []string{"alpha"},
++		addrs:      map[string][]netip.AddrPort{"alpha": {ap("192.0.2.2:5061")}},
++		transports: map[string]string{"alpha": "tls"},
++	}
++
++	d1 := newPinDialog(t, tab, "call-1")
++	d1.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++	if d1.pin == nil {
++		t.Fatal("the dialog took no tls carrier pin")
++	}
++	if !pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("allows refused the pinned carrier triple")
++	}
++	for _, c := range []struct{ carrier, network, dest string }{
++		{"beta", "tls", "192.0.2.1:5061"},  // another carrier at the old address
++		{"alpha", "tcp", "192.0.2.1:5061"}, // another transport
++		{"alpha", "tls", "192.0.2.9:5061"}, // another remote
++	} {
++		if pins.allows(c.carrier, c.network, c.dest) {
++			t.Errorf("allows accepted a foreign triple %+v", c)
++		}
++	}
++	if !pins.pinsRemote("tls", "192.0.2.1:5061") {
++		t.Error("pinsRemote lost the pinned remote")
++	}
++	if n := pins.retiredCount(snap); n != 1 {
++		t.Errorf("retiredCount = %d, want 1 (192.0.2.1 left the snapshot)", n)
++	}
++
++	// A second call on the same generation shares the entry; one ending
++	// leaves the route alive for the other.
++	d2 := newPinDialog(t, tab, "call-2")
++	d2.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++	if d1.end(endByeCaller) {
++		t.Error("an early dialog cannot end as confirmed")
++	}
++	if !pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("the first dialog ending retired the route another dialog still uses")
++	}
++	d2.end(endShutdown)
++	if pins.allows("alpha", "tls", "192.0.2.1:5061") || pins.pinsRemote("tls", "192.0.2.1:5061") {
++		t.Error("the retired route survived its last dialog")
++	}
++	if n := pins.retiredCount(snap); n != 0 {
++		t.Errorf("retiredCount after reclamation = %d, want 0", n)
++	}
++}
++
++// Pinning is a no-op for udp (there is no pseudo-connection), for the
++// "unknown" carrier_sources match, with no dest, and after the dialog ended;
++// repeating it never double-counts.
++func TestCarrierPinsSkipsUDPUnknownAndEnded(t *testing.T) {
++	tab := newPinTable()
++	d := newPinDialog(t, tab, "call-skip")
++	for _, c := range []struct{ carrier, network, dest string }{
++		{"alpha", "udp", "192.0.2.1:5060"},
++		{carrierUnknown, "tls", "192.0.2.1:5061"},
++		{"", "tls", "192.0.2.1:5061"},
++		{"alpha", "tls", ""},
++	} {
++		d.pinCarrier(c.carrier, c.network, c.dest)
++		if d.pin != nil {
++			t.Fatalf("pinCarrier(%+v) recorded a pin", c)
++		}
++	}
++	if n := len(tab.pins.refs); n != 0 {
++		t.Errorf("the table holds %d refs, want none", n)
++	}
++
++	d.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++	first := *d.pin
++	d.pinCarrier("alpha", "tls", "192.0.2.1:5061") // idempotent
++	d.pinCarrier("beta", "tls", "192.0.2.1:5061")  // the first pin sticks
++	if *d.pin != first {
++		t.Error("the dialog's pin changed or double-acquired")
++	}
++	if n := tab.pins.refs[first]; n != 1 {
++		t.Errorf("refs = %d, want 1", n)
++	}
++	d.end(endShutdown)
++	// Too late: a shutdown racing setup must not leave a pin behind.
++	d.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++	if n := len(tab.pins.refs); n != 0 {
++		t.Errorf("a pin acquired after end left %d refs", n)
++	}
++}
++
++// end() releases the pin exactly once however many endings race it: CANCEL,
++// a non-2xx, a timeout, a media fault, BYE and shutdown all converge here.
++func TestCarrierPinsConcurrentEndReleasesOnce(t *testing.T) {
++	tab := newPinTable()
++	pins := tab.pins
++	const n = 16
++	var dialogs []*dialog
++	for i := 0; i < n; i++ {
++		d := newPinDialog(t, tab, "race-"+string(rune('a'+i)))
++		d.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++		dialogs = append(dialogs, d)
++	}
++	// All 16 share one triple, so the entry must read exactly 16...
++	if got := pins.refs[carrierPin{carrier: "alpha", network: "tls", dest: "192.0.2.1:5061"}]; got != n {
++		t.Fatalf("refs = %d, want %d", got, n)
++	}
++	var wg sync.WaitGroup
++	for _, d := range dialogs {
++		wg.Add(1)
++		go func(d *dialog) {
++			defer wg.Done()
++			for j := 0; j < 4; j++ { // redundant endings are no-ops
++				d.end(endShutdown)
++			}
++		}(d)
++	}
++	wg.Wait()
++	if len(pins.refs) != 0 {
++		t.Errorf("pins left after racing ends: %v", pins.refs)
++	}
++	if tab.sessionCount() != 0 {
++		t.Errorf("session count after the race = %d, want 0", tab.sessionCount())
++	}
++}
++
++// A proxy teardown (the BYEs the proxy itself sends after end()) holds the
++// pin across the dialog's exit: the route stays authorized while the BYEs
++// are sent, and the hold reclaims it afterwards.
++func TestCarrierPinsTeardownHoldSurvivesEnd(t *testing.T) {
++	tab := newPinTable()
++	pins := tab.pins
++	d := newPinDialog(t, tab, "teardown")
++	d.pinCarrier("alpha", "tls", "192.0.2.1:5061")
++
++	hold := d.holdPinForTeardown()
++	if hold == nil {
++		t.Fatal("the teardown hold is nil for a pinned dialog")
++	}
++	// The dialog ends (e.g. the media watchdog fired): its own reference is
++	// gone but the teardown BYEs still route.
++	d.end(endRTPSilence)
++	if !pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("the pinned route refused a teardown send after end()")
++	}
++	if n := pins.retiredCount(&carrierSnapshot{}); n != 1 {
++		t.Errorf("retiredCount while the teardown runs = %d, want 1", n)
++	}
++	// The teardown sends complete: the hold is the last owner.
++	if !pins.release(*hold) {
++		t.Error("releasing the teardown hold did not reclaim the route")
++	}
++	if pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("the route survived its teardown hold")
++	}
++
++	// No pin on a non-carrier dialog: no hold.
++	d2 := newPinDialog(t, tab, "teardown-none")
++	if h := d2.holdPinForTeardown(); h != nil {
++		t.Error("a dialog without a carrier pin yielded a teardown hold")
++	}
++	d2.end(endShutdown)
++}
++
++// Destination keys are canonical: an IPv4-mapped IPv6 address and the same
++// AddrPort are one pin, so a redial's lookup cannot miss on notation.
++func TestCarrierPinsCanonicalDest(t *testing.T) {
++	pins := newCarrierPins()
++	pins.retain(carrierPin{carrier: "alpha", network: "tls", dest: canonicalPinDest("[::ffff:192.0.2.1]:5061")})
++	if !pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("the mapped-IPv6 pin does not authorize the canonical IPv4 dest")
++	}
++	if !pins.allows("alpha", "tls", "192.0.2.1:5061") {
++		t.Error("the pin does not authorize its own dest")
++	}
++	if n := len(pins.refs); n != 1 {
++		t.Errorf("the two notations created %d entries, want 1", n)
++	}
++}
++
++// The routing hint is empty unless it names a configured carrier AND the
++// send heads to a carrier dialog's public side.
++func TestCarrierRouteHint(t *testing.T) {
++	if carrierHint("").name != "" || carrierHint(carrierUnknown).name != "" {
++		t.Error("an empty or unknown carrier yielded a routing hint")
++	}
++	if h := carrierHint("alpha"); h.name != "alpha" {
++		t.Errorf("carrierHint(alpha) = %q", h.name)
++	}
++	tab := newPinTable()
++	d := newPinDialog(t, tab, "hint")
++	d.setCarrier("alpha")
++	var s Server
++	priv := side{plane: planePrivate}
++	pub := side{plane: planePublic}
++	if h := s.dialogCarrierHint(d, priv); h.name != "" {
++		t.Error("a send toward the private side carried a carrier hint")
++	}
++	if h := s.dialogCarrierHint(nil, pub); h.name != "" {
++		t.Error("a send without a dialog carried a carrier hint")
++	}
++	if h := s.dialogCarrierHint(d, pub); h.name != "alpha" {
++		t.Errorf("the public carrier hint = %q, want alpha", h.name)
++	}
++	d.end(endShutdown)
++}
+diff --git a/internal/edge/carrierreg.go b/internal/edge/carrierreg.go
+index dac9999..eea2503 100644
+--- a/internal/edge/carrierreg.go
++++ b/internal/edge/carrierreg.go
+@@ -265,7 +265,7 @@ func (s *Server) registerToCarrier(req *sip.Request, tx sip.ServerTransaction, i
+ 		}
+ 		s.publishCarrierRegistrations()
+ 		return nil
+-	})
++	}, carrierHint(carrier))
+ 	if err != nil {
+ 		s.log.Warn("forward carrier REGISTER", "err", err, "carrier", carrier, "sip_call_id", fsip.CallID(req))
+ 		if ctx.Err() != nil {
+diff --git a/internal/edge/dialog.go b/internal/edge/dialog.go
+index 20c60cf..8383eab 100644
+--- a/internal/edge/dialog.go
++++ b/internal/edge/dialog.go
+@@ -119,6 +119,12 @@ type inviteAttempt struct {
+ 	req    *sip.Request
+ 	cancel context.CancelFunc
+ 
++	// carrier is the edge.carriers name the INVITE was sent to, empty for
++	// every other attempt. Its CANCEL must dial as that carrier: it is the
++	// dialog's pinned generation, so after a DNS refresh a lost connection
++	// is re-established with that carrier's TLS/SNI/cert (carrierpin.go).
++	carrier string
++
+ 	sent, cancelled bool
+ }
+ 
+@@ -239,6 +245,14 @@ type dialog struct {
+ 	// (edge.carriers name, or "unknown"); empty for every other call. Set
+ 	// once right after the record is created (setCarrier).
+ 	carrier string
++	// pin is the carrier route — name, stream transport and remote — the
++	// dialog's carrier leg was created with (carrierpin.go). Set once with
++	// pinCarrier, before the first request leaves, and released exactly
++	// once by end(); nil for non-carrier calls and udp carriers. It is what
++	// keeps an in-dialog ACK, BYE, PRACK, UPDATE, INFO, NOTIFY, CANCEL or a
++	// proxy teardown on the carrier generation the call began with after a
++	// DNS refresh has retired the address.
++	pin *carrierPin
+ 	// srtp is the SDES policy of the call's public leg (sdes.go).
+ 	srtp srtpPolicy
+ 
+@@ -347,15 +361,27 @@ type dialogTable struct {
+ 	// onMediaEnd is called, once, for a confirmed dialog that ended because
+ 	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
+ 	// rather than by signaling. Both endpoints still believe the call is
+-	// up, so the server tells them. Set once, before any call exists.
+-	onMediaEnd func(d *dialog, why endReason)
++	// up, so the server tells them. The teardown pin, when set, keeps the
++	// carrier route authorized for those BYEs after end() detached the
++	// dialog and is released when they are sent. Set once, before any call
++	// exists.
++	onMediaEnd func(d *dialog, why endReason, pin *carrierPin)
++
++	// pins is the carrier-generation table every dialog acquires its route
++	// pin from and releases it to in end() (carrierpin.go). Created with the
++	// table and shared by the Server, which authorizes the carrier dials a
++	// lost connection forces against it. onPinRetire is called (not under
++	// the table lock) when a release reclaims a route, so the Server can
++	// close the connection that served only that retired generation.
++	pins        *carrierPins
++	onPinRetire func(carrierPin)
+ 
+ 	metrics *Metrics
+ 	log     *slog.Logger
+ }
+ 
+ func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
+-	return &dialogTable{byCallID: map[string][]*dialog{}, metrics: m, log: log}
++	return &dialogTable{byCallID: map[string][]*dialog{}, pins: newCarrierPins(), metrics: m, log: log}
+ }
+ 
+ // beginResult is what begin did.
+@@ -1091,7 +1117,11 @@ type byeInfo struct {
+ 	remote    string
+ 	contact   sip.Uri
+ 	transport string
+-	carrier   bool // the dialog is a carrier's: masking applies toward the public side
++	// carrier is the dialog's edge.carriers name ("" for a non-carrier
++	// call). Non-empty makes masking apply toward the public side and, on a
++	// stream transport, names the carrier the connection is dialed as — the
++	// dialog's pinned generation, valid after a DNS refresh.
++	carrier string
+ }
+ 
+ // byes describes the two BYEs that end this dialog from the middle: one to
+@@ -1112,10 +1142,10 @@ func (d *dialog) byes() [2]byeInfo {
+ 	return [2]byeInfo{
+ 		{callID: d.callID, toward: d.callerPlane,
+ 			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
+-			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier != ""},
++			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier},
+ 		{callID: d.callID, toward: calleePlane,
+ 			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
+-			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier != ""},
++			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier},
+ 	}
+ }
+ 
+@@ -1165,8 +1195,13 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
+ 		// media ended it — nobody else had — are the endpoints still to be
+ 		// told, and the session says why it closed.
+ 		why := endReasonOf(sess.Cause())
++		// Hold the carrier route across the teardown BYEs, which run after
++		// end() detached the dialog (carrierpin.go).
++		pin := d.holdPinForTeardown()
+ 		if d.end(why) && t.onMediaEnd != nil {
+-			t.onMediaEnd(d, why)
++			t.onMediaEnd(d, why, pin)
++		} else if pin != nil {
++			t.pins.release(*pin)
+ 		}
+ 	}()
+ 	return true
+@@ -1209,11 +1244,27 @@ func (d *dialog) end(reason endReason) bool {
+ 	}
+ 	d.owed = nil
+ 	d.lastAck = nil
++	// Release this dialog's generation pin in the same one-shot
++	// transition: the last dialog off a retired carrier route is what
++	// reclaims it. The table lock is taken before the pin table's, as in
++	// pinCarrier, so the release is atomic with the dialog's exit. The
++	// retire hook — which closes a socket — runs only after the unlock.
++	var retired *carrierPin
++	if d.pin != nil {
++		pin := *d.pin
++		if t.pins.release(pin) {
++			retired = &pin
++		}
++		d.pin = nil
++	}
+ 	sess := d.media
+ 	t.removeLocked(d)
+ 	t.sessions--
+ 	t.metrics.SetSessions(t.sessions)
+ 	t.mu.Unlock()
++	if retired != nil && t.onPinRetire != nil {
++		t.onPinRetire(*retired)
++	}
+ 
+ 	if sess == nil {
+ 		return wasUp
+diff --git a/internal/edge/edge.go b/internal/edge/edge.go
+index aa9a06a..ce58d2c 100644
+--- a/internal/edge/edge.go
++++ b/internal/edge/edge.go
+@@ -48,6 +48,10 @@ type Server struct {
+ 	// Both are written once in New.
+ 	carriers    *carrierDirectory
+ 	carrierURIs map[string]string
++	// carrierPins is the carrier-generation table: creation-time carrier
++	// routes live dialogs co-own with the snapshot they were selected
++	// from (carrierpin.go). Written once in New.
++	carrierPins *carrierPins
+ 	// carrierByName holds each edge.carriers entry; carrierConns dials and
+ 	// pools the tcp and tls connections to them (carrierconn.go). Both are
+ 	// written once in New.
+@@ -248,11 +252,22 @@ func New(store *config.Store, log *slog.Logger, opts ...Option) (*Server, error)
+ 	s.rtpTimeout.Store(int64(rtpSilenceTimeout))
+ 	s.pubPool, s.privPool = newMediaPools(cfg, topo, s.mediaTimeout)
+ 	s.dialogs = newDialogTable(s.metrics, s.log)
++	// The carrier generation table is owned by the dialog table; the
++	// Server keeps the same pointer so requireFlow can authorize a redial
++	// of a dialog's creation-time carrier route after a DNS refresh.
++	s.carrierPins = s.dialogs.pins
++	// When a retired route's last dialog ends, close the connection that
++	// served only that generation.
++	s.dialogs.onPinRetire = func(pin carrierPin) {
++		s.carrierConns.closeRetired(pin.carrier, pin.network, pin.dest)
++	}
+ 	s.subs = newSubTable(s.metrics)
+ 	// A subscription belongs to a registration binding: when the binding
+ 	// goes (un-REGISTER, WebSocket close, expiry) its records go too.
+ 	s.loc.SetOnRemove(s.subs.dropTokens)
+-	s.dialogs.onMediaEnd = s.byeBothEnds
++	s.dialogs.onMediaEnd = func(d *dialog, why endReason, pin *carrierPin) {
++		s.byeBothEnds(d, why, pin)
++	}
+ 	if s.webrtcEnabled {
+ 		s.identity, err = media.ProcessDTLSIdentity()
+ 		if err != nil {
+diff --git a/internal/edge/forward.go b/internal/edge/forward.go
+index e8edc91..a190486 100644
+--- a/internal/edge/forward.go
++++ b/internal/edge/forward.go
+@@ -252,10 +252,13 @@ func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction,
+ //
+ // mode and adapt are for a carrier leg or a request whose final response
+ // needs rewriting (the carrier REGISTER's Contact); plain callers pass
+-// respPlain and nil.
++// respPlain and nil. route names the carrier a stream connection that has
++// to be dialed must be made as (carrierpin.go): the pinned carrier of a
++// dialog's in-dialog request, so a redial keeps its TLS/SNI/cert after a
++// DNS refresh retired the address.
+ func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
+-	mode respHide, adapt func(out *sip.Response) error) (*sip.Response, error) {
+-	clTx, err := s.clientTx(ctx, out)
++	mode respHide, adapt func(out *sip.Response) error, route ...carrierRouteHint) (*sip.Response, error) {
++	clTx, err := s.clientTx(ctx, out, route...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("proxy: forward %s: %w", out.Method, err)
+ 	}
+@@ -306,37 +309,61 @@ var errNoFlow = errors.New("proxy: no connection to the client")
+ // The one exception is a tcp or tls carrier: its destination is an address
+ // FreeSBC resolved from edge.carriers, so a missing connection is dialed
+ // here (carrierconn.go) with that carrier's TLS settings, never by sipgo.
+-func (s *Server) requireFlow(ctx context.Context, req *sip.Request) error {
++//
++// Which carrier that is follows the request's generation (carrierpin.go):
++// the pinned carrier of a live dialog's in-dialog request wins, so after a
++// DNS refresh retired the remote — or moved it to another carrier — a lost
++// connection is re-established with the dialog's own carrier TLS/SNI/cert,
++// while a brand-new transaction is only ever dialed to an address the
++// current snapshot publishes. A hint the pins do not back is ignored.
++func (s *Server) requireFlow(ctx context.Context, req *sip.Request, hint ...carrierRouteHint) error {
+ 	network := sip.NetworkToLower(req.Transport())
+ 	if streamIndex(network) < 0 {
+ 		return nil
+ 	}
+-	c, err := s.srv.TransportLayer().GetConnection(network, req.Destination())
+-	if err == nil && c != nil {
+-		_, _ = c.TryClose() // GetConnection took a reference; hand it back
+-		return nil
++	dest := canonicalPinDest(req.Destination())
++	// Resolve the carrier this send belongs to before touching the pool:
++	// a live dialog's pinned generation wins even when the snapshot has
++	// retired the address or handed it to another carrier. Only with no pin
++	// does the current snapshot admit the dial.
++	name := ""
++	if len(hint) > 0 && hint[0].name != "" && s.carrierPins.allows(hint[0].name, network, dest) {
++		name = hint[0].name
++	} else if n, ok := s.carrierTarget(network, dest); ok {
++		name = n
+ 	}
+-	if name, ok := s.carrierTarget(network, req.Destination()); ok {
+-		return s.carrierConns.ensure(ctx, name, network, req.Destination())
++	if name == "" {
++		// Not a carrier address of any live generation: a client's flow is
++		// never dialed. Serve only when a pooled connection already exists.
++		if c, err := s.srv.TransportLayer().GetConnection(network, dest); err == nil && c != nil {
++			_, _ = c.TryClose() // GetConnection took a reference; hand it back
++			return nil
++		}
++		return errNoFlow
+ 	}
+-	return errNoFlow
++	// The pool check (whose connection is this?) and the dial happen under
++	// one owner: ensure reuses only a connection accepted from, or dialed
++	// as, this carrier.
++	return s.carrierConns.ensure(ctx, name, network, dest)
+ }
+ 
+ // clientTx starts a client transaction for a request FreeSBC built itself
+-// (noBuild), after requireFlow.
+-func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
+-	if err := s.requireFlow(ctx, req); err != nil {
++// (noBuild), after requireFlow. route optionally pins the carrier the
++// connection belongs to (carrierpin.go).
++func (s *Server) clientTx(ctx context.Context, req *sip.Request, route ...carrierRouteHint) (sip.ClientTransaction, error) {
++	if err := s.requireFlow(ctx, req, route...); err != nil {
+ 		return nil, err
+ 	}
+ 	return s.client.TransactionRequest(ctx, req, noBuild)
+ }
+ 
+ // writeRequest sends a request outside any transaction (an ACK), after
+-// requireFlow.
+-func (s *Server) writeRequest(req *sip.Request) error {
++// requireFlow. route optionally pins the carrier the connection belongs to
++// (carrierpin.go).
++func (s *Server) writeRequest(req *sip.Request, route ...carrierRouteHint) error {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
+ 	defer cancel()
+-	if err := s.requireFlow(ctx, req); err != nil {
++	if err := s.requireFlow(ctx, req, route...); err != nil {
+ 		return err
+ 	}
+ 	return s.client.WriteRequest(req, noBuild)
+diff --git a/internal/edge/indialog.go b/internal/edge/indialog.go
+index 11538ad..2e07b48 100644
+--- a/internal/edge/indialog.go
++++ b/internal/edge/indialog.go
+@@ -64,6 +64,10 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ 		}
+ 	}
+ 	hide, resp := s.carrierLeg(req, d, from, to)
++	// The re-INVITE keeps the dialog's own carrier generation: a lost
++	// connection is redialed as the pinned carrier, never re-selected from
++	// the current snapshot.
++	route := s.dialogCarrierHint(d, to)
+ 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
+ 	if err != nil {
+ 		s.reject(req, tx, 483, "Too Many Hops")
+@@ -81,7 +85,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
+ 	defer cancel()
+ 
+-	clTx, err := s.clientTx(ctx, out)
++	clTx, err := s.clientTx(ctx, out, route)
+ 	if err != nil {
+ 		s.log.Debug("forward re-INVITE", "err", err, "sip_call_id", fsip.CallID(req))
+ 		s.reject(req, tx, 503, "Service Unavailable")
+@@ -107,7 +111,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ 		if again {
+ 			// A 2xx FreeSBC could not anchor, retransmitted: its ACK was
+ 			// lost, so send it again.
+-			go s.ack2xx(res, to)
++			go s.ack2xx(res, to, route)
+ 			return
+ 		}
+ 		if ok == nil || fsip.ToTag(res) != fsip.ToTag(ok) {
+@@ -213,10 +217,8 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ 					mu.Lock()
+ 					refused = true
+ 					mu.Unlock()
+-					s.ack2xx(res, to)
+-					if d.end(endReinviteRefused) {
+-						s.byeBothEnds(d, endReinviteRefused)
+-					}
++					s.ack2xx(res, to, route)
++					s.teardownEnd(d, endReinviteRefused)
+ 				}
+ 				return
+ 			}
+@@ -237,7 +239,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ 			// INVITE) and answer the requester 408, or it waits out its own
+ 			// timer and the far end keeps an open INVITE transaction that
+ 			// 491s every later re-INVITE (§14.1).
+-			s.abandonReInvite(req, tx, out, clTx, to)
++			s.abandonReInvite(req, tx, out, clTx, to, route)
+ 			return
+ 		}
+ 	}
+@@ -251,9 +253,9 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
+ // is ACKed by the transaction layer and a 2xx that crossed the CANCEL is
+ // ACKed here rather than retransmitted.
+ func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
+-	clTx sip.ClientTransaction, to side) {
++	clTx sip.ClientTransaction, to side, route carrierRouteHint) {
+ 	s.reject(req, tx, 408, "Request Timeout")
+-	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}})
++	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}, carrier: route.name})
+ 	drain := time.NewTimer(cancelDrain)
+ 	defer drain.Stop()
+ 	responses := clTx.Responses()
+@@ -265,7 +267,7 @@ func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out
+ 				continue
+ 			}
+ 			if res.StatusCode/100 == 2 {
+-				s.ack2xx(res, to)
++				s.ack2xx(res, to, route)
+ 			}
+ 			if res.StatusCode >= 200 {
+ 				return
+@@ -316,6 +318,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+ 		return // nothing to forward it to; an ACK gets no response
+ 	}
+ 	hide, _ := s.carrierLeg(req, d, from, to)
++	route := s.dialogCarrierHint(d, to)
+ 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
+ 	if err != nil {
+ 		return
+@@ -366,11 +369,11 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
+ 			stripBody(out)
+ 		}
+ 	}
+-	if err := s.writeRequest(out); err != nil {
++	if err := s.writeRequest(out, route); err != nil {
+ 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
+ 	}
+-	if answerFailed && d.end(endAnswerUnusable) {
+-		s.byeBothEnds(d, endAnswerUnusable)
++	if answerFailed {
++		s.teardownEnd(d, endAnswerUnusable)
+ 	}
+ }
+ 
+@@ -551,6 +554,11 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
+ 		}
+ 	}
+ 	hide, resp := s.carrierLeg(req, d, from, to)
++	// BYE, PRACK, UPDATE, INFO and NOTIFY on a recorded carrier dialog keep
++	// its creation-time carrier generation: a redial after the pooled
++	// connection was lost uses the pinned carrier's TLS, never a
++	// post-refresh address.
++	route := s.dialogCarrierHint(d, to)
+ 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
+ 	if err != nil {
+ 		s.reject(req, tx, 483, "Too Many Hops")
+@@ -637,7 +645,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
+ 	defer cancel()
+-	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt)
++	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt, route)
+ 	if err != nil {
+ 		s.log.Warn("forward in-dialog request failed", "err", err,
+ 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
+@@ -656,7 +664,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
+ 			// A clone: the failed client transaction may still hold the
+ 			// original request (a retransmission timer winding down), so
+ 			// handing the same object to WriteRequest would race it.
+-			if werr := s.writeRequest(out.Clone()); werr != nil {
++			if werr := s.writeRequest(out.Clone(), route); werr != nil {
+ 				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
+ 					"sip_call_id", fsip.CallID(req))
+ 			}
+@@ -671,9 +679,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
+ 		s.log.Warn("UPDATE media negotiation failed", "err", answerErr, "sip_call_id", fsip.CallID(req))
+ 		s.reject(req, tx, 488, "Not Acceptable Here")
+ 		if ux != nil && ux.fork == nil {
+-			if d.end(endAnswerUnusable) {
+-				s.byeBothEnds(d, endAnswerUnusable)
+-			}
++			s.teardownEnd(d, endAnswerUnusable)
+ 		} else {
+ 			s.cancelCall(d, cancelBackstop)
+ 		}
+@@ -892,11 +898,45 @@ func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
+ // BYE, and a phone would sit in a silent call (RFC 3261 §15). FreeSBC sends
+ // each one a BYE on behalf of the other, built from the identities and CSeqs
+ // the dialog record kept. why is the reason end() recorded.
+-func (s *Server) byeBothEnds(d *dialog, why endReason) {
++// teardownEnd ends a dialog the proxy must follow with BYEs to both ends
++// (a media timeout or an answer it could not anchor): it takes the
++// teardown carrier pin before end() — the BYEs run after the record is
++// gone and otherwise would lose their pinned route — and hands it to
++// byeBothEnds. When end() loses the race (a BYE ended the call first) no
++// teardown is sent and the hold is dropped.
++func (s *Server) teardownEnd(d *dialog, why endReason) bool {
++	pin := d.holdPinForTeardown()
++	if d.end(why) {
++		s.byeBothEnds(d, why, pin)
++		return true
++	}
++	if pin != nil {
++		s.carrierPins.release(*pin)
++	}
++	return false
++}
++
++func (s *Server) byeBothEnds(d *dialog, why endReason, pin *carrierPin) {
+ 	s.log.Info("ending the call; sending BYE to both ends",
+ 		"sip_call_id", d.callID, "reason", why.String())
++	var wg sync.WaitGroup
+ 	for _, b := range d.byes() {
+-		go s.sendMiddleBye(b)
++		b := b
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			s.sendMiddleBye(b)
++		}()
++	}
++	// Keep the pinned carrier route authorized until both BYEs are sent,
++	// then drop the hold and reclaim a retired connection it kept open.
++	if pin != nil {
++		go func() {
++			wg.Wait()
++			if s.carrierPins.release(*pin) {
++				s.carrierConns.closeRetired(pin.carrier, pin.network, pin.dest)
++			}
++		}()
+ 	}
+ }
+ 
+@@ -928,7 +968,7 @@ func (s *Server) sendMiddleBye(b byeInfo) {
+ 	req.AppendHeader(toward.via(fsip.NewBranch()))
+ 	mf := sip.MaxForwardsHeader(70)
+ 	req.AppendHeader(&mf)
+-	if b.carrier && toward.plane == planePublic {
++	if b.carrier != "" && toward.plane == planePublic {
+ 		// Identity toward a carrier never names the switch (hide.go).
+ 		s.maskURI(&b.fromURI, toward.advIP)
+ 		s.maskURI(&b.toURI, toward.advIP)
+@@ -951,10 +991,17 @@ func (s *Server) sendMiddleBye(b byeInfo) {
+ 		// by the socket the endpoint's NAT pinhole or WebSocket is on.
+ 		req.Laddr = toward.laddr
+ 	}
++	// Toward a carrier this BYE follows the dialog's pinned generation, so
++	// after a DNS refresh a lost connection is re-established as that
++	// carrier, with its TLS/SNI/cert, rather than refused as nobody's.
++	var route carrierRouteHint
++	if toward.plane == planePublic {
++		route = carrierHint(b.carrier)
++	}
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+-	clTx, err := s.clientTx(ctx, req)
++	clTx, err := s.clientTx(ctx, req, route)
+ 	if err != nil {
+ 		s.log.Debug("bye after media end", "err", err, "sip_call_id", b.callID)
+ 		return
+diff --git a/internal/edge/invite.go b/internal/edge/invite.go
+index d52b1ce..16ada75 100644
+--- a/internal/edge/invite.go
++++ b/internal/edge/invite.go
+@@ -322,6 +322,12 @@ func (s *Server) inviteToUpstream(req *sip.Request, tx sip.ServerTransaction, sr
+ 	defer d.endUnlessUp()
+ 	if carrier != "" {
+ 		d.setCarrier(carrier)
++		// Pin the carrier generation this call ARRIVED from: a mid-call
++		// BYE the proxy originates (or any other request toward the
++		// caller's carrier leg) keeps its carrier, transport and source
++		// address for the call's life, after any DNS refresh
++		// (carrierpin.go).
++		d.pinCarrier(carrier, from.transport, req.Source())
+ 	}
+ 	d.setSRTP(s.legSRTPPolicy(carrier, from.transport))
+ 
+diff --git a/internal/edge/invite_leg.go b/internal/edge/invite_leg.go
+index d31de25..9e1de9e 100644
+--- a/internal/edge/invite_leg.go
++++ b/internal/edge/invite_leg.go
+@@ -121,11 +121,14 @@ func (s *Server) onLate2xx(l *inviteLeg, res *sip.Response) {
+ // established but FreeSBC will not relay: ACK then BYE the first time, ACK
+ // alone for a retransmission.
+ func (s *Server) refuse2xx(l *inviteLeg, res *sip.Response) {
++	// The far side is the leg the 2xx came from; when it is a carrier, the
++	// ACK/BYE follow the attempt's pinned generation.
++	route := s.dialogCarrierHint(l.dialog(), l.far)
+ 	if l.dialog().reject2xx(fsip.ToTag(res)) {
+-		go s.ackThenBye(res, l.far)
++		go s.ackThenBye(res, l.far, route)
+ 		return
+ 	}
+-	go s.ack2xx(res, l.far)
++	go s.ack2xx(res, l.far, route)
+ }
+ 
+ // errNoAnswer reports a 2xx that carries no SDP on a fork that never
+@@ -354,15 +357,17 @@ func (s *Server) drainCancelledInvite(l *inviteLeg) {
+ // ackThenBye completes and immediately tears down a dialog FreeSBC
+ // accepted at the SIP layer but cannot anchor media for. RFC 3261 requires
+ // a 2xx to be ACKed; without that the far end retransmits its 200 until
+-// Timer H, and the dialog lingers either way. ACK, then BYE.
+-func (s *Server) ackThenBye(res *sip.Response, from side) {
+-	if !s.ack2xx(res, from) {
++// Timer H, and the dialog lingers either way. ACK, then BYE. route names
++// the pinned carrier when the far side is a carrier, so a redial keeps the
++// dialog's generation after a DNS refresh.
++func (s *Server) ackThenBye(res *sip.Response, from side, route carrierRouteHint) {
++	if !s.ack2xx(res, from, route) {
+ 		return
+ 	}
+ 	bye := fsip.TeardownRequest(sip.BYE, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res)+1, s.teardownOpts(from)...)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+-	clTx, err := s.clientTx(ctx, bye)
++	clTx, err := s.clientTx(ctx, bye, route)
+ 	if err != nil {
+ 		s.log.Debug("bye unanchorable dialog", "err", err)
+ 		return
+@@ -375,10 +380,11 @@ func (s *Server) ackThenBye(res *sip.Response, from side) {
+ 	}
+ }
+ 
+-// ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself.
+-func (s *Server) ack2xx(res *sip.Response, from side) bool {
++// ack2xx sends the end-to-end ACK for a 2xx FreeSBC answers itself. route
++// names the pinned carrier when the far side is a carrier leg.
++func (s *Server) ack2xx(res *sip.Response, from side, route carrierRouteHint) bool {
+ 	ack := fsip.TeardownRequest(sip.ACK, res, from.via(fsip.NewBranch()), fsip.CSeqNumber(res), s.teardownOpts(from)...)
+-	if err := s.writeRequest(ack); err != nil {
++	if err := s.writeRequest(ack, route); err != nil {
+ 		s.log.Debug("ack unanchorable answer", "err", err)
+ 		return false
+ 	}
+@@ -467,7 +473,10 @@ func (s *Server) sendCancel(a *inviteAttempt) {
+ 	cancelReq := fsip.BuildCancel(a.req)
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+-	clTx, err := s.clientTx(ctx, cancelReq)
++	// The CANCEL follows the INVITE's own carrier generation, pinned on
++	// the attempt: a connection lost while the call rings is redialed as
++	// that carrier.
++	clTx, err := s.clientTx(ctx, cancelReq, carrierHint(a.carrier))
+ 	a.cancel()
+ 	if err != nil {
+ 		s.log.Debug("forward CANCEL", "err", err, "sip_call_id", fsip.CallID(a.req))
+diff --git a/internal/edge/offerless.go b/internal/edge/offerless.go
+index a458752..1be15c5 100644
+--- a/internal/edge/offerless.go
++++ b/internal/edge/offerless.go
+@@ -174,9 +174,7 @@ func (s *Server) owedExpired(d *dialog, o *owedAnswer) {
+ 		o.release()
+ 	}
+ 	s.log.Warn("answer to a delayed offer never arrived; ending the call", "sip_call_id", d.callID)
+-	if d.end(endAnswerTimeout) {
+-		s.byeBothEnds(d, endAnswerTimeout)
+-	}
++	s.teardownEnd(d, endAnswerTimeout)
+ }
+ 
+ // prepareOwed validates the answer body and rebuilds it for the callee. It
+diff --git a/internal/edge/stream.go b/internal/edge/stream.go
+index 38a722d..319fd5a 100644
+--- a/internal/edge/stream.go
++++ b/internal/edge/stream.go
+@@ -214,6 +214,12 @@ func (t *streamTable) open() int {
+ // outlive a quiet minute: a live registration binding made over it, a dialog
+ // routed to it, or a carrier source (carriers keep their own sessions and
+ // are bounded by the per-source cap instead).
++//
++// A carrier address a DNS refresh retired is no longer a snapshot source, so
++// the connection an existing call still rides is protected by its pinned
++// generation instead: confirmed dialogs through usesRemote, and — because an
++// early dialog's route is still on its forks — the pin table, which covers
++// an INVITE still ringing on the address as well.
+ func (s *Server) streamBusy(transport string, ap netip.AddrPort) bool {
+ 	if s.loc.HasSource(transport, ap) {
+ 		return true
+@@ -221,6 +227,9 @@ func (s *Server) streamBusy(transport string, ap netip.AddrPort) bool {
+ 	if s.carriers.snapshot().isSource(ap.Addr()) {
+ 		return true
+ 	}
++	if s.carrierPins.pinsRemote(transport, ap.String()) {
++		return true
++	}
+ 	return s.dialogs.usesRemote(transport, ap.String())
+ }
+ 
+@@ -397,6 +406,10 @@ type streamConn struct {
+ 	// carrier is whether the connection is to or from a carrier, which
+ 	// decides the connection cap it was counted against.
+ 	carrier bool
++	// onClose, when set, runs once inside Close's closeOnce. It is how the
++	// carrier dialer forgets the carrier identity it recorded for a
++	// connection FreeSBC itself opened (carrierconn.go).
++	onClose func()
+ 
+ 	// pending is data already read from the connection that sipgo has yet
+ 	// to see: the WebSocket upgrade request, received during prepare.
+@@ -554,6 +567,9 @@ func (c *streamConn) Close() error {
+ 	c.closeOnce.Do(func() {
+ 		err = c.Conn.Close()
+ 		s := c.l.s
++		if c.onClose != nil {
++			c.onClose()
++		}
+ 		s.streams.release(c.ap.Addr(), c.carrier)
+ 		s.metrics.StreamConnClosed(c.l.transport)
+ 		if n := s.loc.RemoveBySourceOn(c.l.transport, c.ap); n > 0 {

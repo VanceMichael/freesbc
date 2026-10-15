@@ -214,11 +214,20 @@ func (t *streamTable) open() int {
 // outlive a quiet minute: a live registration binding made over it, a dialog
 // routed to it, or a carrier source (carriers keep their own sessions and
 // are bounded by the per-source cap instead).
+//
+// A carrier address a DNS refresh retired is no longer a snapshot source, so
+// the connection an existing call still rides is protected by its pinned
+// generation instead: confirmed dialogs through usesRemote, and — because an
+// early dialog's route is still on its forks — the pin table, which covers
+// an INVITE still ringing on the address as well.
 func (s *Server) streamBusy(transport string, ap netip.AddrPort) bool {
 	if s.loc.HasSource(transport, ap) {
 		return true
 	}
 	if s.carriers.snapshot().isSource(ap.Addr()) {
+		return true
+	}
+	if s.carrierPins.pinsRemote(transport, ap.String()) {
 		return true
 	}
 	return s.dialogs.usesRemote(transport, ap.String())
@@ -397,6 +406,10 @@ type streamConn struct {
 	// carrier is whether the connection is to or from a carrier, which
 	// decides the connection cap it was counted against.
 	carrier bool
+	// onClose, when set, runs once inside Close's closeOnce. It is how the
+	// carrier dialer forgets the carrier identity it recorded for a
+	// connection FreeSBC itself opened (carrierconn.go).
+	onClose func()
 
 	// pending is data already read from the connection that sipgo has yet
 	// to see: the WebSocket upgrade request, received during prepare.
@@ -554,6 +567,9 @@ func (c *streamConn) Close() error {
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
 		s := c.l.s
+		if c.onClose != nil {
+			c.onClose()
+		}
 		s.streams.release(c.ap.Addr(), c.carrier)
 		s.metrics.StreamConnClosed(c.l.transport)
 		if n := s.loc.RemoveBySourceOn(c.l.transport, c.ap); n > 0 {

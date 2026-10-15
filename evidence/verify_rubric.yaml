@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 成功 DNS 刷新后，新出对话 carrier 事务只使用当前地址；刷新前已建立或仍为 early dialog 的事务继续保留创建时的远端、transport 和 carrier 身份。
+  - id: 2
+    type: f2p
+    text: 旧 TCP/TLS 池连接断开后，已知 dialog 的 ACK、BYE、PRACK、UPDATE、INFO、NOTIFY、重传和主动 teardown 可用原 carrier 的 TLS/SNI/客户端证书配置重拨旧远端，不会仅因快照换址返回 errNoFlow。
+  - id: 3
+    type: f2p
+    text: 退休地址不能通过 admission 发起新的出对话事务；同一地址后来属于另一 carrier 时也不会改变旧 dialog 的 carrier 身份，只有匹配标签和 plane 的既有 dialog 能使用保留路由。
+  - id: 4
+    type: f2p
+    text: early 与 confirmed dialog 对退休路由的取得和释放恰好一次，CANCEL、非 2xx、超时、媒体失败、BYE、关机及并发结束均幂等收敛，最后一个相关 dialog 结束后清除退休代次及重拨元数据。
+  - id: 5
+    type: f2p
+    text: DNS 解析失败继续保留 last-good 且不产生伪代次；后续成功及连续多次地址轮换能区分当前代次和仍被 dialog 引用的退休代次，不复活已释放地址也不泄漏状态。
+  - id: 6
+    type: f2p
+    text: 新旧地址分流和旧流恢复期间，Contact、双 Record-Route、响应路由、SDP/拓扑隐藏及 ACK、PRACK、UPDATE、re-INVITE、INFO、NOTIFY、BYE 的既有协议语义保持不变。
+  - id: 7
+    type: p2p
+    text: UDP、字面 IP、单地址和静态 carrier_sources 保持兼容，UDP 不创建连接租约；现有错误码、容量限制、指标标签和无需配置迁移的启动行为无回归。

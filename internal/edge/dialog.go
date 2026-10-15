@@ -119,6 +119,12 @@ type inviteAttempt struct {
 	req    *sip.Request
 	cancel context.CancelFunc
 
+	// carrier is the edge.carriers name the INVITE was sent to, empty for
+	// every other attempt. Its CANCEL must dial as that carrier: it is the
+	// dialog's pinned generation, so after a DNS refresh a lost connection
+	// is re-established with that carrier's TLS/SNI/cert (carrierpin.go).
+	carrier string
+
 	sent, cancelled bool
 }
 
@@ -239,6 +245,14 @@ type dialog struct {
 	// (edge.carriers name, or "unknown"); empty for every other call. Set
 	// once right after the record is created (setCarrier).
 	carrier string
+	// pin is the carrier route — name, stream transport and remote — the
+	// dialog's carrier leg was created with (carrierpin.go). Set once with
+	// pinCarrier, before the first request leaves, and released exactly
+	// once by end(); nil for non-carrier calls and udp carriers. It is what
+	// keeps an in-dialog ACK, BYE, PRACK, UPDATE, INFO, NOTIFY, CANCEL or a
+	// proxy teardown on the carrier generation the call began with after a
+	// DNS refresh has retired the address.
+	pin *carrierPin
 	// srtp is the SDES policy of the call's public leg (sdes.go).
 	srtp srtpPolicy
 
@@ -347,15 +361,27 @@ type dialogTable struct {
 	// onMediaEnd is called, once, for a confirmed dialog that ended because
 	// its media did (the silence watchdog, a DTLS fingerprint mismatch),
 	// rather than by signaling. Both endpoints still believe the call is
-	// up, so the server tells them. Set once, before any call exists.
-	onMediaEnd func(d *dialog, why endReason)
+	// up, so the server tells them. The teardown pin, when set, keeps the
+	// carrier route authorized for those BYEs after end() detached the
+	// dialog and is released when they are sent. Set once, before any call
+	// exists.
+	onMediaEnd func(d *dialog, why endReason, pin *carrierPin)
+
+	// pins is the carrier-generation table every dialog acquires its route
+	// pin from and releases it to in end() (carrierpin.go). Created with the
+	// table and shared by the Server, which authorizes the carrier dials a
+	// lost connection forces against it. onPinRetire is called (not under
+	// the table lock) when a release reclaims a route, so the Server can
+	// close the connection that served only that retired generation.
+	pins        *carrierPins
+	onPinRetire func(carrierPin)
 
 	metrics *Metrics
 	log     *slog.Logger
 }
 
 func newDialogTable(m *Metrics, log *slog.Logger) *dialogTable {
-	return &dialogTable{byCallID: map[string][]*dialog{}, metrics: m, log: log}
+	return &dialogTable{byCallID: map[string][]*dialog{}, pins: newCarrierPins(), metrics: m, log: log}
 }
 
 // beginResult is what begin did.
@@ -1091,7 +1117,11 @@ type byeInfo struct {
 	remote    string
 	contact   sip.Uri
 	transport string
-	carrier   bool // the dialog is a carrier's: masking applies toward the public side
+	// carrier is the dialog's edge.carriers name ("" for a non-carrier
+	// call). Non-empty makes masking apply toward the public side and, on a
+	// stream transport, names the carrier the connection is dialed as — the
+	// dialog's pinned generation, valid after a DNS refresh.
+	carrier string
 }
 
 // byes describes the two BYEs that end this dialog from the middle: one to
@@ -1112,10 +1142,10 @@ func (d *dialog) byes() [2]byeInfo {
 	return [2]byeInfo{
 		{callID: d.callID, toward: d.callerPlane,
 			fromURI: d.calleeURI, fromTag: d.calleeTag, toURI: d.callerURI, toTag: d.callerTag,
-			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[1] + 1, remote: cRemote, contact: cContact, transport: r.transport, carrier: d.carrier},
 		{callID: d.callID, toward: calleePlane,
 			fromURI: d.callerURI, fromTag: d.callerTag, toURI: d.calleeURI, toTag: d.calleeTag,
-			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier != ""},
+			cseq: d.cseq[0] + 1, remote: eRemote, contact: eContact, transport: r.transport, carrier: d.carrier},
 	}
 }
 
@@ -1165,8 +1195,13 @@ func (d *dialog) confirm(calleeTag string, r dialogRoute) bool {
 		// media ended it — nobody else had — are the endpoints still to be
 		// told, and the session says why it closed.
 		why := endReasonOf(sess.Cause())
+		// Hold the carrier route across the teardown BYEs, which run after
+		// end() detached the dialog (carrierpin.go).
+		pin := d.holdPinForTeardown()
 		if d.end(why) && t.onMediaEnd != nil {
-			t.onMediaEnd(d, why)
+			t.onMediaEnd(d, why, pin)
+		} else if pin != nil {
+			t.pins.release(*pin)
 		}
 	}()
 	return true
@@ -1209,11 +1244,27 @@ func (d *dialog) end(reason endReason) bool {
 	}
 	d.owed = nil
 	d.lastAck = nil
+	// Release this dialog's generation pin in the same one-shot
+	// transition: the last dialog off a retired carrier route is what
+	// reclaims it. The table lock is taken before the pin table's, as in
+	// pinCarrier, so the release is atomic with the dialog's exit. The
+	// retire hook — which closes a socket — runs only after the unlock.
+	var retired *carrierPin
+	if d.pin != nil {
+		pin := *d.pin
+		if t.pins.release(pin) {
+			retired = &pin
+		}
+		d.pin = nil
+	}
 	sess := d.media
 	t.removeLocked(d)
 	t.sessions--
 	t.metrics.SetSessions(t.sessions)
 	t.mu.Unlock()
+	if retired != nil && t.onPinRetire != nil {
+		t.onPinRetire(*retired)
+	}
 
 	if sess == nil {
 		return wasUp

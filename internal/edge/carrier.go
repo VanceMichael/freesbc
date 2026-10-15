@@ -218,6 +218,12 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}
 	defer d.endUnlessUp()
 	d.setCarrier(carrier)
+	// Pin the carrier generation this call is selected from: the new
+	// INVITE goes to the current snapshot's dest, and every later
+	// in-dialog request — including a CANCEL or teardown while still
+	// early — keeps this carrier, transport and remote for the call's
+	// life, after any DNS refresh (carrierpin.go).
+	d.pinCarrier(carrier, to.transport, dest)
 	d.setSRTP(s.legSRTPPolicy(carrier, ""))
 
 	// An offerless INVITE is forwarded as it is: the offer is the
@@ -271,13 +277,13 @@ func (s *Server) inviteToCarrier(req *sip.Request, tx sip.ServerTransaction, car
 	}) {
 		return
 	}
-	a := &inviteAttempt{req: out, cancel: cancel}
+	a := &inviteAttempt{req: out, cancel: cancel, carrier: carrier}
 	if !d.track(a) {
 		return
 	}
 	defer d.untrack()
 
-	clTx, err := s.clientTx(ctx, out)
+	clTx, err := s.clientTx(ctx, out, carrierHint(carrier))
 	if err != nil {
 		s.log.Warn("forward INVITE to carrier", "err", err, "carrier", carrier)
 		s.giveUp(ctx, d, req, tx, 503, "Service Unavailable")
@@ -323,7 +329,7 @@ func (s *Server) optionsToCarrier(req *sip.Request, tx sip.ServerTransaction, ca
 			stripBody(res)
 		}
 		return nil
-	}); err != nil {
+	}, carrierHint(carrier)); err != nil {
 		s.log.Debug("forward carrier OPTIONS", "err", err, "carrier", carrier)
 		if ctx.Err() != nil {
 			s.reject(req, tx, 504, "Server Time-out")

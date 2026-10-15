@@ -265,7 +265,7 @@ func (s *Server) registerToCarrier(req *sip.Request, tx sip.ServerTransaction, i
 		}
 		s.publishCarrierRegistrations()
 		return nil
-	})
+	}, carrierHint(carrier))
 	if err != nil {
 		s.log.Warn("forward carrier REGISTER", "err", err, "carrier", carrier, "sip_call_id", fsip.CallID(req))
 		if ctx.Err() != nil {

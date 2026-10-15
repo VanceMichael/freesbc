@@ -64,6 +64,10 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		}
 	}
 	hide, resp := s.carrierLeg(req, d, from, to)
+	// The re-INVITE keeps the dialog's own carrier generation: a lost
+	// connection is redialed as the pinned carrier, never re-selected from
+	// the current snapshot.
+	route := s.dialogCarrierHint(d, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
@@ -81,7 +85,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 	ctx, cancel := context.WithTimeout(context.Background(), s.inviteBudget())
 	defer cancel()
 
-	clTx, err := s.clientTx(ctx, out)
+	clTx, err := s.clientTx(ctx, out, route)
 	if err != nil {
 		s.log.Debug("forward re-INVITE", "err", err, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 503, "Service Unavailable")
@@ -107,7 +111,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 		if again {
 			// A 2xx FreeSBC could not anchor, retransmitted: its ACK was
 			// lost, so send it again.
-			go s.ack2xx(res, to)
+			go s.ack2xx(res, to, route)
 			return
 		}
 		if ok == nil || fsip.ToTag(res) != fsip.ToTag(ok) {
@@ -213,10 +217,8 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 					mu.Lock()
 					refused = true
 					mu.Unlock()
-					s.ack2xx(res, to)
-					if d.end(endReinviteRefused) {
-						s.byeBothEnds(d, endReinviteRefused)
-					}
+					s.ack2xx(res, to, route)
+					s.teardownEnd(d, endReinviteRefused)
 				}
 				return
 			}
@@ -237,7 +239,7 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 			// INVITE) and answer the requester 408, or it waits out its own
 			// timer and the far end keeps an open INVITE transaction that
 			// 491s every later re-INVITE (§14.1).
-			s.abandonReInvite(req, tx, out, clTx, to)
+			s.abandonReInvite(req, tx, out, clTx, to, route)
 			return
 		}
 	}
@@ -251,9 +253,9 @@ func (s *Server) onReInvite(req *sip.Request, tx sip.ServerTransaction, onPrivat
 // is ACKed by the transaction layer and a 2xx that crossed the CANCEL is
 // ACKed here rather than retransmitted.
 func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
-	clTx sip.ClientTransaction, to side) {
+	clTx sip.ClientTransaction, to side, route carrierRouteHint) {
 	s.reject(req, tx, 408, "Request Timeout")
-	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}})
+	s.sendCancel(&inviteAttempt{req: out, cancel: func() {}, carrier: route.name})
 	drain := time.NewTimer(cancelDrain)
 	defer drain.Stop()
 	responses := clTx.Responses()
@@ -265,7 +267,7 @@ func (s *Server) abandonReInvite(req *sip.Request, tx sip.ServerTransaction, out
 				continue
 			}
 			if res.StatusCode/100 == 2 {
-				s.ack2xx(res, to)
+				s.ack2xx(res, to, route)
 			}
 			if res.StatusCode >= 200 {
 				return
@@ -316,6 +318,7 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 		return // nothing to forward it to; an ACK gets no response
 	}
 	hide, _ := s.carrierLeg(req, d, from, to)
+	route := s.dialogCarrierHint(d, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		return
@@ -366,11 +369,11 @@ func (s *Server) onAck(req *sip.Request, tx sip.ServerTransaction, in inbound) {
 			stripBody(out)
 		}
 	}
-	if err := s.writeRequest(out); err != nil {
+	if err := s.writeRequest(out, route); err != nil {
 		s.log.Debug("forward ACK", "err", err, "sip_call_id", fsip.CallID(req))
 	}
-	if answerFailed && d.end(endAnswerUnusable) {
-		s.byeBothEnds(d, endAnswerUnusable)
+	if answerFailed {
+		s.teardownEnd(d, endAnswerUnusable)
 	}
 }
 
@@ -551,6 +554,11 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		}
 	}
 	hide, resp := s.carrierLeg(req, d, from, to)
+	// BYE, PRACK, UPDATE, INFO and NOTIFY on a recorded carrier dialog keep
+	// its creation-time carrier generation: a redial after the pooled
+	// connection was lost uses the pinned carrier's TLS, never a
+	// post-refresh address.
+	route := s.dialogCarrierHint(d, to)
 	out, err := s.prepareForwardFor(req, from, to, dest, false, hide)
 	if err != nil {
 		s.reject(req, tx, 483, "Too Many Hops")
@@ -637,7 +645,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 
 	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Second)
 	defer cancel()
-	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt)
+	final, err := s.forwardAndRelay(ctx, req, tx, out, resp, adapt, route)
 	if err != nil {
 		s.log.Warn("forward in-dialog request failed", "err", err,
 			"method", req.Method.String(), "sip_call_id", fsip.CallID(req))
@@ -656,7 +664,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 			// A clone: the failed client transaction may still hold the
 			// original request (a retransmission timer winding down), so
 			// handing the same object to WriteRequest would race it.
-			if werr := s.writeRequest(out.Clone()); werr != nil {
+			if werr := s.writeRequest(out.Clone(), route); werr != nil {
 				s.log.Warn("resend in-dialog BYE toward far side", "err", werr,
 					"sip_call_id", fsip.CallID(req))
 			}
@@ -671,9 +679,7 @@ func (s *Server) onInDialog(req *sip.Request, tx sip.ServerTransaction, in inbou
 		s.log.Warn("UPDATE media negotiation failed", "err", answerErr, "sip_call_id", fsip.CallID(req))
 		s.reject(req, tx, 488, "Not Acceptable Here")
 		if ux != nil && ux.fork == nil {
-			if d.end(endAnswerUnusable) {
-				s.byeBothEnds(d, endAnswerUnusable)
-			}
+			s.teardownEnd(d, endAnswerUnusable)
 		} else {
 			s.cancelCall(d, cancelBackstop)
 		}
@@ -892,11 +898,45 @@ func (s *Server) retargetInDialog(req, out *sip.Request, to side, d *dialog) {
 // BYE, and a phone would sit in a silent call (RFC 3261 §15). FreeSBC sends
 // each one a BYE on behalf of the other, built from the identities and CSeqs
 // the dialog record kept. why is the reason end() recorded.
-func (s *Server) byeBothEnds(d *dialog, why endReason) {
+// teardownEnd ends a dialog the proxy must follow with BYEs to both ends
+// (a media timeout or an answer it could not anchor): it takes the
+// teardown carrier pin before end() — the BYEs run after the record is
+// gone and otherwise would lose their pinned route — and hands it to
+// byeBothEnds. When end() loses the race (a BYE ended the call first) no
+// teardown is sent and the hold is dropped.
+func (s *Server) teardownEnd(d *dialog, why endReason) bool {
+	pin := d.holdPinForTeardown()
+	if d.end(why) {
+		s.byeBothEnds(d, why, pin)
+		return true
+	}
+	if pin != nil {
+		s.carrierPins.release(*pin)
+	}
+	return false
+}
+
+func (s *Server) byeBothEnds(d *dialog, why endReason, pin *carrierPin) {
 	s.log.Info("ending the call; sending BYE to both ends",
 		"sip_call_id", d.callID, "reason", why.String())
+	var wg sync.WaitGroup
 	for _, b := range d.byes() {
-		go s.sendMiddleBye(b)
+		b := b
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendMiddleBye(b)
+		}()
+	}
+	// Keep the pinned carrier route authorized until both BYEs are sent,
+	// then drop the hold and reclaim a retired connection it kept open.
+	if pin != nil {
+		go func() {
+			wg.Wait()
+			if s.carrierPins.release(*pin) {
+				s.carrierConns.closeRetired(pin.carrier, pin.network, pin.dest)
+			}
+		}()
 	}
 }
 
@@ -928,7 +968,7 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 	req.AppendHeader(toward.via(fsip.NewBranch()))
 	mf := sip.MaxForwardsHeader(70)
 	req.AppendHeader(&mf)
-	if b.carrier && toward.plane == planePublic {
+	if b.carrier != "" && toward.plane == planePublic {
 		// Identity toward a carrier never names the switch (hide.go).
 		s.maskURI(&b.fromURI, toward.advIP)
 		s.maskURI(&b.toURI, toward.advIP)
@@ -951,10 +991,17 @@ func (s *Server) sendMiddleBye(b byeInfo) {
 		// by the socket the endpoint's NAT pinhole or WebSocket is on.
 		req.Laddr = toward.laddr
 	}
+	// Toward a carrier this BYE follows the dialog's pinned generation, so
+	// after a DNS refresh a lost connection is re-established as that
+	// carrier, with its TLS/SNI/cert, rather than refused as nobody's.
+	var route carrierRouteHint
+	if toward.plane == planePublic {
+		route = carrierHint(b.carrier)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	clTx, err := s.clientTx(ctx, req)
+	clTx, err := s.clientTx(ctx, req, route)
 	if err != nil {
 		s.log.Debug("bye after media end", "err", err, "sip_call_id", b.callID)
 		return

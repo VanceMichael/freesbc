@@ -252,10 +252,13 @@ func (s *Server) relayResponseHide(orig *sip.Request, tx sip.ServerTransaction, 
 //
 // mode and adapt are for a carrier leg or a request whose final response
 // needs rewriting (the carrier REGISTER's Contact); plain callers pass
-// respPlain and nil.
+// respPlain and nil. route names the carrier a stream connection that has
+// to be dialed must be made as (carrierpin.go): the pinned carrier of a
+// dialog's in-dialog request, so a redial keeps its TLS/SNI/cert after a
+// DNS refresh retired the address.
 func (s *Server) forwardAndRelay(ctx context.Context, req *sip.Request, tx sip.ServerTransaction, out *sip.Request,
-	mode respHide, adapt func(out *sip.Response) error) (*sip.Response, error) {
-	clTx, err := s.clientTx(ctx, out)
+	mode respHide, adapt func(out *sip.Response) error, route ...carrierRouteHint) (*sip.Response, error) {
+	clTx, err := s.clientTx(ctx, out, route...)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: forward %s: %w", out.Method, err)
 	}
@@ -306,37 +309,61 @@ var errNoFlow = errors.New("proxy: no connection to the client")
 // The one exception is a tcp or tls carrier: its destination is an address
 // FreeSBC resolved from edge.carriers, so a missing connection is dialed
 // here (carrierconn.go) with that carrier's TLS settings, never by sipgo.
-func (s *Server) requireFlow(ctx context.Context, req *sip.Request) error {
+//
+// Which carrier that is follows the request's generation (carrierpin.go):
+// the pinned carrier of a live dialog's in-dialog request wins, so after a
+// DNS refresh retired the remote — or moved it to another carrier — a lost
+// connection is re-established with the dialog's own carrier TLS/SNI/cert,
+// while a brand-new transaction is only ever dialed to an address the
+// current snapshot publishes. A hint the pins do not back is ignored.
+func (s *Server) requireFlow(ctx context.Context, req *sip.Request, hint ...carrierRouteHint) error {
 	network := sip.NetworkToLower(req.Transport())
 	if streamIndex(network) < 0 {
 		return nil
 	}
-	c, err := s.srv.TransportLayer().GetConnection(network, req.Destination())
-	if err == nil && c != nil {
-		_, _ = c.TryClose() // GetConnection took a reference; hand it back
-		return nil
+	dest := canonicalPinDest(req.Destination())
+	// Resolve the carrier this send belongs to before touching the pool:
+	// a live dialog's pinned generation wins even when the snapshot has
+	// retired the address or handed it to another carrier. Only with no pin
+	// does the current snapshot admit the dial.
+	name := ""
+	if len(hint) > 0 && hint[0].name != "" && s.carrierPins.allows(hint[0].name, network, dest) {
+		name = hint[0].name
+	} else if n, ok := s.carrierTarget(network, dest); ok {
+		name = n
 	}
-	if name, ok := s.carrierTarget(network, req.Destination()); ok {
-		return s.carrierConns.ensure(ctx, name, network, req.Destination())
+	if name == "" {
+		// Not a carrier address of any live generation: a client's flow is
+		// never dialed. Serve only when a pooled connection already exists.
+		if c, err := s.srv.TransportLayer().GetConnection(network, dest); err == nil && c != nil {
+			_, _ = c.TryClose() // GetConnection took a reference; hand it back
+			return nil
+		}
+		return errNoFlow
 	}
-	return errNoFlow
+	// The pool check (whose connection is this?) and the dial happen under
+	// one owner: ensure reuses only a connection accepted from, or dialed
+	// as, this carrier.
+	return s.carrierConns.ensure(ctx, name, network, dest)
 }
 
 // clientTx starts a client transaction for a request FreeSBC built itself
-// (noBuild), after requireFlow.
-func (s *Server) clientTx(ctx context.Context, req *sip.Request) (sip.ClientTransaction, error) {
-	if err := s.requireFlow(ctx, req); err != nil {
+// (noBuild), after requireFlow. route optionally pins the carrier the
+// connection belongs to (carrierpin.go).
+func (s *Server) clientTx(ctx context.Context, req *sip.Request, route ...carrierRouteHint) (sip.ClientTransaction, error) {
+	if err := s.requireFlow(ctx, req, route...); err != nil {
 		return nil, err
 	}
 	return s.client.TransactionRequest(ctx, req, noBuild)
 }
 
 // writeRequest sends a request outside any transaction (an ACK), after
-// requireFlow.
-func (s *Server) writeRequest(req *sip.Request) error {
+// requireFlow. route optionally pins the carrier the connection belongs to
+// (carrierpin.go).
+func (s *Server) writeRequest(req *sip.Request, route ...carrierRouteHint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*streamHandshakeTimeout)
 	defer cancel()
-	if err := s.requireFlow(ctx, req); err != nil {
+	if err := s.requireFlow(ctx, req, route...); err != nil {
 		return err
 	}
 	return s.client.WriteRequest(req, noBuild)
